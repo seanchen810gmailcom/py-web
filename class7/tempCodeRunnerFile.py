@@ -1,1 +1,0 @@
-print(check_type)
