@@ -1668,26 +1668,115 @@ if __name__=="__main__":  # 逐行註解：判斷這個條件是否成立，成�
 
 """
 工具筆記：
-1. rg：
-   用來快速搜尋 AI.py 裡的 web_search、fetch_web_pages、followup.send 等關鍵字，
-   比一行一行翻檔案快很多。
+這段是給你讀程式時看的筆記，不會被 Python 當成會執行的程式邏輯。
+因為它放在檔案最底下，而且沒有被變數接住，所以只是一段多行文字註解。
 
-2. sed / nl：
-   sed 用來印出指定範圍的程式碼；nl 會加上行號，
-   方便確認要改的位置，也方便最後告訴你是哪幾行。
+一、這次我用到的工具
 
-3. apply_patch：
-   用來安全修改檔案內容。
-   這次我用它加了 /web_search 的進度註解、來源連結註解，以及這段工具筆記。
+1. rg
+   rg 是 ripgrep，用來快速搜尋整個檔案裡的關鍵字。
+   我用它找 web_search、fetch_web_pages、followup.send、thinking 等位置。
+   用途是先定位真正要改的區塊，不用用眼睛從頭慢慢翻到尾。
 
-4. python3 -m py_compile：
-   用來檢查 AI.py 的 Python 語法有沒有壞掉。
-   它不會真的啟動 Discord bot，只會做語法編譯檢查。
+2. sed
+   sed 可以印出檔案中的指定行數範圍。
+   我用它查看某幾段程式碼，例如 /web_search 附近、底部 main 附近。
+   用途是確認上下文，避免只看單行就亂改。
 
-5. git diff --check：
-   用來檢查改動裡有沒有多餘空白、壞掉的縮排或格式問題。
+3. nl
+   nl 會把檔案內容加上行號印出來。
+   我用它看每段程式碼的行號，方便確認註解加在哪裡，也方便最後回報位置。
 
-6. ast：
-   用 Python 內建 ast 模組解析 AI.py，
-   確認 decorator 還是掛在正確的 web_search 函式上，不是掛到 helper 函式上。
+4. apply_patch
+   apply_patch 是用來修改檔案的工具。
+   我用它手動改 import 註解、/web_search 註解、來源連結註解，以及這段多行工具筆記。
+   好處是每次改動都有明確的上下文，比直接整份覆蓋安全。
+
+5. python3 -m py_compile
+   這個指令只檢查 Python 語法能不能編譯。
+   它不會真的啟動 Discord bot，也不會連線 Discord。
+   我用它確認加註解後沒有弄壞括號、縮排、字串或語法。
+
+6. git diff --check
+   這個指令檢查 diff 裡有沒有格式問題。
+   例如多餘空白、壞掉的縮排、行尾空白等。
+   我用它確認改註解時沒有留下容易造成版本管理問題的格式髒污。
+
+7. ast
+   ast 是 Python 內建的語法樹解析工具。
+   我用它確認 AI.py 仍然能被 Python 正常解析，
+   也確認 /web_search 的 decorator 還是掛在真正的 web_search 函式上。
+
+8. tokenize
+   tokenize 是 Python 內建的詞法分析工具。
+   我用它分辨哪些行是一般程式碼、哪些行是在多行字串裡。
+   這很重要，因為不能把 # 註解硬塞進 prompt 或工具筆記的多行字串內容裡，
+   不然會改變 bot 實際丟給 Ollama 的 prompt。
+
+二、這份檔案匯入的模組筆記
+
+1. asyncio
+   asyncio 是 Python 內建的非同步工具。
+   這支 bot 需要同時等 Discord 訊息、等網頁回應、等 Ollama 回答。
+   如果不用 asyncio，等待其中一件事時整個 bot 可能會卡住。
+
+2. discord
+   discord 是 discord.py 套件。
+   它負責跟 Discord 溝通，例如登入 bot、接收訊息、發送訊息、建立 slash 指令、顯示 Modal。
+
+3. os
+   os 在這裡主要用來讀環境變數。
+   例如 DC_BOT_TOKEN、ALLOWED_DISCORD_USER_ID、DISCORD_BOT_QUIT_PASSWORD 都是透過 os.getenv 讀出來。
+
+4. dotenv.load_dotenv
+   load_dotenv 會讀取 .env 檔案。
+   讀完後，.env 裡的設定就可以被 os.getenv 拿到。
+
+5. textwrap
+   textwrap 用來切長文字。
+   Discord 單則訊息有長度限制，所以 AI 回覆太長時要切成多段送出。
+
+6. json
+   json 用來處理 JSON 格式。
+   Ollama 的 HTTP API 需要 JSON request，也會回傳 JSON response。
+
+7. base64
+   base64 用來把圖片 bytes 轉成文字。
+   Ollama vision API 的 images 欄位需要這種格式，才能把 Discord 附件圖片送去分析。
+
+8. uuid
+   uuid 用來產生不重複 ID。
+   這裡可用來建立不容易撞名的圖片檔名。
+
+9. pathlib.Path
+   Path 用來處理檔案和資料夾路徑。
+   比直接手寫字串路徑安全，也比較容易跨資料夾操作。
+
+10. urllib.request
+   urllib.request 在這份檔案裡被命名成 urlrequest。
+   它負責送 HTTP request，例如打開 DuckDuckGo 搜尋頁或實際讀取搜尋結果網頁。
+
+11. urllib.parse
+   urllib.parse 在這份檔案裡被命名成 urlparse。
+   它負責處理網址，例如把搜尋文字做 URL 編碼、解析 query string、還原 DuckDuckGo 的 uddg 真正網址。
+
+12. urllib.error.URLError / HTTPError
+   這兩個是網路請求可能發生的錯誤類型。
+   URLError 偏向連線層級問題，HTTPError 偏向伺服器回傳錯誤狀態碼。
+
+13. html.parser.HTMLParser
+   HTMLParser 是 Python 內建 HTML 解析器。
+   這份檔案用它解析 DuckDuckGo 搜尋結果，也用它把網頁 HTML 轉成可餵給 Ollama 的純文字。
+
+14. time
+   time 用來計算時間。
+   這份檔案用 time.monotonic 計算使用者發問後，到搜尋、讀網頁、Ollama 回覆完成總共花多久。
+
+15. re
+   re 是正規表達式工具。
+   這份檔案用它清掉 ANSI 控制碼、移除 thinking process、判斷文字規則和搜尋關鍵字。
+
+16. signal
+   signal 用來處理系統訊號。
+   例如你按 Ctrl+C 或系統要求程式結束時，bot 可以先做收尾流程，再關閉。
 """
