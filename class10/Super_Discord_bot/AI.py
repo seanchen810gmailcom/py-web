@@ -33,8 +33,10 @@ import requests  # 匯入 requests：用來查詢天氣 API 和其他 HTTP 請�
 from myfunction.myfunction import WwatherAPI  # 匯入 WwatherAPI：天氣查詢工具類別。
 
 from chart_utils import make_bar_chart, make_line_chart, make_pie_chart, make_temperature_line_chart, make_humidity_line_chart, make_table_image  # 匯入圖表工具：用 matplotlib 在記憶體產生 PNG BytesIO。
+from chart_parser import parse_chart_text  # 匯入圖表文字解析工具：從使用者輸入用正規表達式抓出標籤與數值。
 from format_utils import SUCCESS, ERROR, symbol_demo_text, WEATHER_TEMP, WEATHER_HUMIDITY, WEATHER_WIND, WEATHER_UMBRELLA, WEATHER_CLOUD, make_markdown_table, split_long_message, make_weather_embed as make_weather_summary_embed, weather_symbol_for_text  # 匯入格式工具：提供狀態符號、天氣符號、表格分段與天氣 Embed。
 from weather_utils import get_current_weather_summary, get_weekly_weather_table, get_today_hourly_table, get_today_rain_table, group_today_weather_periods, extract_today_temperature_series, extract_today_humidity_series, get_weather_alert_messages  # 匯入天氣資料整理工具：把 OpenWeather current/forecast 轉成摘要、表格、圖表序列和主動警報。
+import dataset_utils  # 匯入資料集工具：負責處理 data.gov.tw 資料集頁面與 CSV 下載。
 
 #######################初始化#######################
 def find_env_file():
@@ -93,14 +95,14 @@ ALLOWED_USER_LIST = load_env_list("ALLOWED_USERS")  # 逐行註解：讀取一�
 SUPER_USER_KEYS = set(SUPER_USER_LIST)  # 逐行註解：建立超級使用者集合，讓每次權限判斷能快速查找。
 ALLOWED_USER_KEYS = set(ALLOWED_USER_LIST)  # 逐行註解：建立一般允許使用者集合，讓每次權限判斷能快速查找。
 CONFIGURED_PERMISSION_EMAIL_ALIASES = {key.split("@", 1)[0]: key for key in (SUPER_USER_KEYS | ALLOWED_USER_KEYS) if "@" in key and key.split("@", 1)[0]}  # 逐行註解：把設定中的 email local-part 對應回完整 email，支援 Discord 名稱對應 email。
-SENSITIVE_COMMAND_NAMES = {"agent", "state", "run", "quit", "restart", "shell", "stop", "shutdown", "reload", "eval", "exec", "debug", "debugstate", "admin"}  # 逐行註解：集中列出所有只能 SUPER_USERS 使用的敏感指令名稱。
+SENSITIVE_COMMAND_NAMES = {"agent", "state", "run", "quit", "restart", "shell", "shutdown", "reload", "eval", "exec", "debug", "admin", "web_search"}  # 逐行註解：集中列出所有只能 SUPER_USERS 使用的敏感指令名稱，包含 web_search 以觸發 Sean 審核流程。
 WEATHER_ALERT_DM_USER_IDS_RAW = os.getenv("WEATHER_ALERT_DM_USER_IDS", "").strip()  # 逐行註解：天氣警報仍可另外設定 Discord 數字 ID；沒設定時會改通知允許使用者。
 WEATHER_ALERT_DM_USER_IDS = unique_env_items(split_env_list(WEATHER_ALERT_DM_USER_IDS_RAW))  # 逐行註解：整理天氣警報專用 ID 清單，避免同一 ID 收到重複警報。
 WEATHER_ALERT_CITY = os.getenv("WEATHER_ALERT_CITY", "Taipei").strip() or "Taipei"  # 逐行註解：設定要監控的城市，預設台北。
 WEATHER_ALERT_CHECK_SECONDS = max(60, int(os.getenv("WEATHER_ALERT_CHECK_SECONDS", "300")))  # 逐行註解：設定天氣警報檢查間隔，預設 5 分鐘且最低 60 秒。
 DISCORD_BOT_QUIT_PASSWORD = os.getenv("DISCORD_BOT_QUIT_PASSWORD", "").strip()  # 逐行註解：設定 DISCORD_BOT_QUIT_PASSWORD 這個變數，供後面的流程使用。
 NO_PERMISSION_MESSAGE = "You're not allowed to use this bot."  # 逐行註解：統一設定未在 ALLOWED_USERS 或 SUPER_USERS 時的拒絕文字。
-SENSITIVE_PERMISSION_MESSAGE = "Not super user"  # 逐行註解：統一設定非 SUPER_USERS 使用敏感功能時的拒絕文字。
+SENSITIVE_PERMISSION_MESSAGE = "Not super user, asking Sean"  # 逐行註解：統一設定非 SUPER_USERS 使用敏感功能時的拒絕文字，同時表示已通知 Sean 審核。
 STOP_AI_MESSAGE = "⏹️ Stop Thinking"  # 逐行註解：統一設定 /stop 成功停止 AI 任務時要顯示的文字。
 startup_dm_sent = False  # 逐行註解：設定 startup_dm_sent 這個變數，供後面的流程使用。
 shutdown_dm_sent = False  # 逐行註解：設定 shutdown_dm_sent 這個變數，供後面的流程使用。
@@ -157,20 +159,32 @@ dm_user_model: dict[int, str] = {}  # 逐行註解：把右邊算出的值存到
 # /run 終端模式會話管理
 terminal_sessions: dict[int, dict] = {}  # 逐行註解：追蹤活躍的終端會話，key 是使用者 ID，value 是會話資訊（訊息、頻道、輸出等）。
 agent_sessions: dict[int, dict] = {}  # 逐行註解：追蹤活躍的 AI Agent 模式，key 是使用者 ID，value 是任務歷史、指令歷史和目前頻道。
+
+# ===== Sean 審核系統用 =====
+# key 格式：(user_id, command_name) -> {request_id, timestamp, interaction, command_name, user}
+PENDING_SENSITIVE_APPROVALS: dict[tuple[int, str], dict] = {}  # 逐行註解：儲存等待 Sean 審核的請求，避免重複發送 DM。
+ONE_TIME_SENSITIVE_GRANTS: dict[tuple[int, str], float] = {}  # 逐行註解：儲存 Sean 批准後的一次性授權，value 為過期時間戳記（5 分鐘），不寫入檔案。
+SEAN_APPROVAL_EMAIL = "seanchen810@gmail.com"  # 逐行註解：唯一 SUPER_USER 的 email，用來查找 Sean 的 Discord 帳號並發送審核 DM。
+SEAN_APPROVAL_GRANT_SECONDS = 300  # 逐行註解：授權有效期 5 分鐘，經過後即失效。
 active_ai_runs: dict[int, dict] = {}  # 逐行註解：追蹤每位使用者目前正在思考的 AI 任務，讓 /stop 可以取消。
 AGENT_MAX_RETRIES = 5  # 逐行註解：Agent 每個任務最多修正/重試 5 次，避免無限 loop。
 AGENT_COMMAND_TIMEOUT_SECONDS = 90  # 逐行註解：Agent 執行 shell command 的 timeout，避免長時間指令卡死 Discord bot。
 AGENT_MODEL = "gemma4_agent_discord-bot"  # 逐行註解：Agent 模式固定使用這個專用模型，不讀使用者目前在聊天模式選的模型。
 
-# 對話記憶有兩層：
-# 1. 共享記憶：同一個使用者的 /web_search 結果會存在這裡，讓不同模型都看得到。
-# 2. 模型記憶：同一個使用者在某個模型下的一般聊天會存在這裡，避免不同模型互相污染風格。
-# 送進 Ollama 時不限制固定輪次，而是塞到接近 max token 預算為止。
+# 對話記憶有三層：
+# 1. Summary memory：整理後的長期記憶，會優先放進 prompt，讓小模型也容易理解。
+# 2. 共享記憶：同一個使用者的 /web_search 結果會存在這裡，讓不同模型都看得到。
+# 3. 模型記憶：同一個使用者在某個模型下的一般聊天會存在這裡，避免不同模型互相污染風格。
+# /summary_memory 會強制用 gemma4_thinking 整理全部記憶，使用者確認後更新 summary；/clear 只清空聊天記錄。
 # 這裡用字元數粗估 token；如果想調整總記憶量，可以在 .env 設 CONVERSATION_MEMORY_MAX_CHARS。
 # 如果想調整單筆訊息保留多長，可以在 .env 設 CONVERSATION_MEMORY_ENTRY_MAX_CHARS。
+SUMMARY_MEMORY_MODEL = "__summary_user_memory__"  # 逐行註解：整理後 summary memory 的特殊 key，不是真正的 Ollama 模型名稱。
+SUMMARY_MEMORY_OLLAMA_MODEL = "gemma4_thinking"  # 逐行註解：summary memory 固定用 gemma4_thinking 產生，不能由使用者切換。
 SHARED_MEMORY_MODEL = "__shared_user_memory__"  # 逐行註解：建立一個共享記憶用的特殊名稱，讓 web_search 結果可以被所有文字模型看到。
 CONVERSATION_MEMORY_MAX_CHARS = int(os.getenv("CONVERSATION_MEMORY_MAX_CHARS", "12000"))  # 逐行註解：設定 CONVERSATION_MEMORY_MAX_CHARS 這個變數，供後面的流程使用。
 CONVERSATION_MEMORY_ENTRY_MAX_CHARS = int(os.getenv("CONVERSATION_MEMORY_ENTRY_MAX_CHARS", "6000"))  # 逐行註解：設定單筆對話最多保存幾個字，避免 web_search 長回答被 1200 字切太短。
+SUMMARY_MEMORY_SOURCE_MAX_CHARS = int(os.getenv("SUMMARY_MEMORY_SOURCE_MAX_CHARS", "30000"))  # 逐行註解：summary memory 整理時最多拿多少 raw memory 給 gemma4_thinking。
+SUMMARY_MEMORY_ENTRY_MAX_CHARS = int(os.getenv("SUMMARY_MEMORY_ENTRY_MAX_CHARS", "9000"))  # 逐行註解：整理後的 summary memory 最多保存幾個字。
 conversation_memory: dict[tuple[int, str], list[dict[str, str]]] = {}  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
 
 # 圖片只存到這個資料夾，送出後會刪掉（避免誤刪其他地方的檔案）
@@ -334,15 +348,226 @@ async def permission_interaction_check(interaction: discord.Interaction) -> bool
     if command_name in SENSITIVE_COMMAND_NAMES:  # 逐行註解：敏感指令必須是 SUPER_USERS。
         if require_super_user(interaction.user):  # 逐行註解：超級使用者可以繼續執行敏感指令。
             return True  # 逐行註解：回傳 True 讓 command body 執行。
-        await send_interaction_permission_denied(interaction, SENSITIVE_PERMISSION_MESSAGE)  # 逐行註解：非超級使用者使用敏感功能時回覆指定文字。
+        if command_name == "web_search":  # 逐行註解：只有 web_search 可以走 Sean Approval 流程。
+            if has_one_time_sensitive_grant(interaction.user.id, command_name):  # 逐行註解：檢查是否有 Sean 批准的一次性授權。
+                consume_one_time_sensitive_grant(interaction.user.id, command_name)  # 逐行註解：消耗授權，只能用一次。
+                return True  # 逐行註解：授權有效，讓 command body 執行。
+            asyncio.create_task(request_sensitive_approval(interaction, command_name))  # 逐行註解：异步觸發 Sean 審核，不阻塌其他事件。
+            return False  # 逐行註解：阻止 command body 執行。
+        await send_interaction_permission_denied(interaction, "Not super user")  # 逐行註解：非 SUPER_USER 使用其他敏感功能，直接拒絕。
         return False  # 逐行註解：阻止 command body 執行。
     if require_allowed_user(interaction.user):  # 逐行註解：一般指令允許 ALLOWED_USERS 與 SUPER_USERS 使用。
         return True  # 逐行註解：權限通過，讓 command body 執行。
     await send_interaction_permission_denied(interaction, NO_PERMISSION_MESSAGE)  # 逐行註解：不在兩層權限名單的人不能使用 bot。
-    return False  # 逐行註解：阻止 command body 執行。
+    return False  # 逐行註解：阻止 command body 執行.
 
 
 tree.interaction_check = permission_interaction_check  # 逐行註解：把統一權限閘門掛到所有 slash command 前面。
+
+
+# ===== Sean 審核系統 Helpers =====
+
+async def _find_sean_user() -> discord.User | None:
+    """用 SEAN_APPROVAL_EMAIL 從 SUPER_USER_LIST 找 Sean 的 Discord 帳號。"""
+    # 先看看 SUPER_USER_LIST 裡有沒有數字 ID，有就直接 fetch_user
+    for key in SUPER_USER_LIST:  # 逐行註解：逐一檢查 SUPER_USER_LIST 裡的每一個 key。
+        if key.isdigit():  # 逐行註解：數字 key 就是 Discord user ID。
+            try:  # 逐行註解：嘗試用 Discord API 取得使用者物件。
+                user = bot.get_user(int(key)) or await bot.fetch_user(int(key))  # 逐行註解：先讀本地快取，沒有才 fetch。
+                if user:  # 逐行註解：找到使用者就回傳。
+                    return user  # 逐行註解：回傳 Sean 的 Discord 使用者物件。
+            except Exception:  # 逐行註解：預防 fetch 失敗時崩潰。
+                pass  # 逐行註解：找不到就繼續找下一個 key。
+    # 如果沒有數字 ID，就嘗試從 guild members 比對 email
+    for guild in bot.guilds:  # 逐行註解：逐一檢查 bot 所在的所有伺服器。
+        for member in guild.members:  # 逐行註解：逐一檢查伺服器成員。
+            if SEAN_APPROVAL_EMAIL in get_discord_user_keys(member):  # 逐行註解：檢查 email 是否屬於這个成員。
+                return member  # 逐行註解：找到 Sean 就回傳。
+    return None  # 逐行註解：完全找不到就回傳 None。
+
+
+def has_one_time_sensitive_grant(user_id: int, command_name: str) -> bool:
+    """檢查使用者對指定指令是否有未過期的一次性授權。"""
+    key = (user_id, command_name)  # 逐行註解：用 (user_id, command_name) 組成查詢 key。
+    if key not in ONE_TIME_SENSITIVE_GRANTS:  # 逐行註解：如果根本沒有授權就回傳 False。
+        return False  # 逐行註解：沒有授權。
+    if time.monotonic() > ONE_TIME_SENSITIVE_GRANTS[key]:  # 逐行註解：檢查授權是否已過期。
+        print(f"DEBUG: one-time grant expired user_id={user_id} command={command_name}")  # 逐行註解：後台 log 授權過期。
+        del ONE_TIME_SENSITIVE_GRANTS[key]  # 逐行註解：清除過期授權避免占空間。
+        return False  # 逐行註解：授權已過期。
+    return True  # 逐行註解：授權有效。
+
+
+def consume_one_time_sensitive_grant(user_id: int, command_name: str) -> bool:
+    """消耗一次性授權，成功就刪除并回傳 True。"""
+    key = (user_id, command_name)  # 逐行註解：組成 key。
+    if not has_one_time_sensitive_grant(user_id, command_name):  # 逐行註解：沒授權或已過期就不能消耗。
+        return False  # 逐行註解：回傳失敗。
+    print(f"DEBUG: one-time grant consumed user_id={user_id} command={command_name}")  # 逐行註解：後台 log 授權被使用。
+    del ONE_TIME_SENSITIVE_GRANTS[key]  # 逐行註解：立刻刪除授權，确保只能用一次。
+    return True  # 逐行註解：成功消耗授權。
+
+
+class SensitiveApprovalPasswordModal(discord.ui.Modal, title="Approve sensitive request"):
+    """輸入審核密碼用的 Modal。"""
+    password = discord.ui.TextInput(  # 逐行註解：密碼欄位。
+        label="請輸入敏感功能密碼",  # 逐行註解：讓 Sean 知道要輸入哪一層密碼。
+        placeholder="DISCORD_BOT_QUIT_PASSWORD",  # 逐行註解：提示使用現有密碼環境變數。
+        required=True,  # 逐行註解：密碼必填。
+        max_length=200,  # 逐行註解：限制密碼長度。
+    )  # 逐行註解：結束 TextInput。
+
+    def __init__(self, pending_key: tuple, request_id: str, requester: discord.User | discord.Member, approval_msg: discord.Message):
+        super().__init__()  # 逐行註解：呼叫父類建構式。
+        self.pending_key = pending_key  # 逐行註解：保存 (user_id, command_name) key，審核後用來查找 pending 審核記錄。
+        self.request_id = request_id  # 逐行註解：保存此次審核的唯一 ID。
+        self.requester = requester  # 逐行註解：保存請求使用者物件，稍後用來通知。
+        self.approval_msg = approval_msg  # 逐行註解：保存 Sean DM 裡的審核訊息物件，審核後用來更新内容。
+
+    async def on_submit(self, interaction: discord.Interaction):  # 逐行註解：處理 Sean 送出密碼表單。
+        if not require_super_user(interaction.user):  # 逐行註解：審核密碼對話框只限 SUPER_USER 操作。
+            await interaction.response.send_message(SENSITIVE_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：非超級使用者不能操作。
+            return  # 逐行註解：停止流程。
+        entered_password = self.password.value.strip()  # 逐行註解：取得 Sean 輸入的密碼，不印到 log。
+        if not DISCORD_BOT_QUIT_PASSWORD or entered_password != DISCORD_BOT_QUIT_PASSWORD:  # 逐行註解：比對現有敏感密碼環境變數，不印密碼。
+            # 密碼錯誤：清除 pending，通知原使用者和 Sean
+            PENDING_SENSITIVE_APPROVALS.pop(self.pending_key, None)  # 逐行註解：審核失敗就清除 pending 記錄。
+            await interaction.response.send_message("密碼錯誤。Request denied.", ephemeral=True)  # 逐行註解：向 Sean 顮認密碼錯誤。
+            print(f"DEBUG: sensitive approval denied request_id={self.request_id}")  # 逐行註解：後台 log。
+            try:  # 逐行註解：嘗試更新 Sean DM 裡的審核訊息。
+                await self.approval_msg.edit(content="Password wrong. Request denied.", view=None)  # 逐行註解：更新 Sean DM 訊息內容。
+            except Exception:  # 逐行註解：編輯失敗不崩潰。
+                pass  # 逐行註解：忽略編輯失敗。
+            try:  # 逐行註解：嘗試從 pending 記錄找到原使用者 channel 并通知。
+                pending = PENDING_SENSITIVE_APPROVALS.get(self.pending_key)  # 逐行註解：安全取得 pending 記錄。
+                channel = pending["channel"] if pending else None  # 逐行註解：決定要回魏哪個頻道。
+                if channel:  # 逐行註解：有頻道才發送通知。
+                    await channel.send(f"<@{self.requester.id}> Sean approval password was wrong. Request denied.")  # 逐行註解：通知原使用者密碼錯誤。
+            except Exception:  # 逐行註解：通知失敗不崩潰。
+                pass  # 逐行註解：忽略通知失敗。
+            return  # 逐行註解：結束函式。
+        # 密碼正確：建立一次性授權
+        cmd_name = self.pending_key[1]  # 逐行註解：取得指令名稱。
+        ONE_TIME_SENSITIVE_GRANTS[self.pending_key] = time.monotonic() + SEAN_APPROVAL_GRANT_SECONDS  # 逐行註解：建立五分鐘授權時間。
+        PENDING_SENSITIVE_APPROVALS.pop(self.pending_key, None)  # 逐行註解：清除 pending。
+        print(f"DEBUG: sensitive approval approved request_id={self.request_id}")  # 逐行註解：後台 log。
+        await interaction.response.send_message(f"已允許這次請求。使用者可在 5 分鐘內重新執行一次。", ephemeral=True)  # 逐行註解： Sean 看到成功訊息。
+        try:  # 逐行註解：嘗試更新 Sean DM 裡的審核訊息。
+            await self.approval_msg.edit(content=f"已允許這次請求。使用者可在 5 分鐘內重新執行一次。", view=None)  # 逐行註解：更新審核訊息。
+        except Exception:  # 逐行註解：編輯失敗不崩潰。
+            pass  # 逐行註解：忽略失敗。
+        try:  # 逐行註解：嘗試從 pending 記錄或直接用 requester 找到頻道并通知。
+            pending = PENDING_SENSITIVE_APPROVALS.get(self.pending_key)  # 逐行註解：安全取得 pending，清除前可能已沒有。
+            channel = pending["channel"] if pending else None  # 逐行註解：找到原使用者頻道。
+            if channel:  # 逐行註解：有頻道才發送。
+                await channel.send(f"<@{self.requester.id}> Sean approved this request. Please run the command again within 5 minutes.")  # 逐行註解：通知原使用者可以重新執行。
+            else:  # 逐行註解：找不到頻道時嘗試發送 DM。
+                await self.requester.send(f"Sean approved your `/{cmd_name}` request. Please run the command again within 5 minutes.")  # 逐行註解：直接 DM 通知原使用者。
+        except Exception:  # 逐行註解：通知失敗不崩潰。
+            pass  # 逐行註解：忽略通知失敗。
+
+
+class SensitiveApprovalView(discord.ui.View):
+    """發給 Sean 的審核按鈕：允許 / 不允許。"""
+
+    def __init__(self, pending_key: tuple, request_id: str, requester: discord.User | discord.Member, channel):
+        super().__init__(timeout=600)  # 逐行註解：10 分鐘超時，避免審核 View 永遠占著。
+        self.pending_key = pending_key  # 逐行註解：保存 (user_id, command_name) key。
+        self.request_id = request_id  # 逐行註解：保存審核唯一 ID。
+        self.requester = requester  # 逐行註解：保存請求使用者物件。
+        self.channel = channel  # 逐行註解：保存請求來源頻道，拒絕時用來通知。
+        self.approval_msg: discord.Message | None = None  # 逐行註解：稍後由 request_sensitive_approval 設定，讓 Modal 可以更新訊息。
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:  # 逐行註解：限制只有 SUPER_USER 可以按。
+        if require_super_user(interaction.user):  # 逐行註解：檢查按鈕的使用者是否為 SUPER_USER。
+            return True  # 逐行註解： SUPER_USER 可以按。
+        await interaction.response.send_message(SENSITIVE_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：非 SUPER_USER 按審核按鈕會看到該訊息。
+        return False  # 逐行註解：阻止非 SUPER_USER 操作按鈕。
+
+    @discord.ui.button(label="允許", style=discord.ButtonStyle.success)  # 逐行註解：綠色允許按鈕。
+    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # 逐行註解：處理 Sean 按「允許」。
+        modal = SensitiveApprovalPasswordModal(  # 逐行註解：跟出密碼 Modal。
+            pending_key=self.pending_key,  # 逐行註解：傳入 pending key。
+            request_id=self.request_id,  # 逐行註解：傳入審核 ID。
+            requester=self.requester,  # 逐行註解：傳入請求使用者。
+            approval_msg=self.approval_msg,  # 逐行註解：傳入審核訊息物件，密碼正確後 Modal 會更新它。
+        )  # 逐行註解：結束 Modal 建構。
+        await interaction.response.send_modal(modal)  # 逐行註解：發送密碼 Modal。
+
+    @discord.ui.button(label="不允許", style=discord.ButtonStyle.danger)  # 逐行註解：紅色不允許按鈕。
+    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # 逐行註解：處理 Sean 按「不允許」。
+        PENDING_SENSITIVE_APPROVALS.pop(self.pending_key, None)  # 逐行註解：清除 pending 記錄。
+        print(f"DEBUG: sensitive approval denied request_id={self.request_id}")  # 逐行註解：後台 log。
+        await interaction.response.edit_message(content="已拒絕這次請求。", view=None)  # 逐行註解： Sean DM 訊息更新為已拒絕。
+        try:  # 逐行註解：嘗試通知原使用者被拒絕。
+            if self.channel:  # 逐行註解：有原頻道就在那裡發送。
+                await self.channel.send(f"<@{self.requester.id}> Sean declined this request.")  # 逐行註解：通知原使用者被拒絕。
+            else:  # 逐行註解：沒有頻道就 DM。
+                await self.requester.send("Sean declined this request.")  # 逐行註解：直接 DM 請求使用者。
+        except Exception:  # 逐行註解：通知失敗不崩潰。
+            pass  # 逐行註解：忽略。
+
+
+async def request_sensitive_approval(interaction: discord.Interaction, command_name: str) -> None:
+    """非 SUPER_USER 使用敏感功能時，發送 DM 請 Sean 審核。"""
+    user = interaction.user  # 逐行註解：取得請求使用者。
+    user_id = user.id  # 逐行註解：取得使用者 ID。
+    pending_key = (user_id, command_name)  # 逐行註解：組成審核 dict key。
+    print(f"DEBUG: sensitive approval requested user_id={user_id} command={command_name}")  # 逐行註解：後台 log。
+    # --- 避免重複發送 ---
+    if pending_key in PENDING_SENSITIVE_APPROVALS:  # 逐行註解：如果同一 user + command 已經有審核中，不重複發 DM。
+        await send_interaction_permission_denied(  # 逐行註解：回覆請求者易已有審核中。
+            interaction,
+            SENSITIVE_PERMISSION_MESSAGE + "\nApproval request already pending."
+        )  # 逐行註解：結束回覆。
+        return  # 逐行註解：結束函式。
+    # --- 找 Sean 的 Discord 帳號 ---
+    sean_user = await _find_sean_user()  # 逐行註解：查找 Sean 的 Discord 使用者物件。
+    if not sean_user:  # 逐行註解：找不到 Sean 就 log 并回覆。
+        print(f"DEBUG: cannot notify Sean for sensitive approval")  # 逐行註解：後台 log。
+        await send_interaction_permission_denied(interaction, SENSITIVE_PERMISSION_MESSAGE)  # 逐行註解：件回覆請求者。
+        return  # 逐行註解：找不到 Sean 就結束。
+    # --- 對請求者回覆拒絕訊息 ---
+    await send_interaction_permission_denied(interaction, SENSITIVE_PERMISSION_MESSAGE)  # 逐行註解：先回覆請求者。
+    # --- 組對 DM 內容 ---
+    request_id = str(uuid.uuid4())[:8]  # 逐行註解：產生簡短唯一 ID。
+    guild_name = interaction.guild.name if interaction.guild else "DM"  # 逐行註解：取得來源伺服器名稱。
+    channel_name = getattr(interaction.channel, "name", "DM")  # 逐行註解：取得頻道名稱。
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 逐行註解：目前時間。
+    # 審核訊息內容
+    dm_content = (
+        f"有人要求使用 SUPER_USER 功能\n\n"
+        f"使用者名稱：{user.display_name}\n"
+        f"使用者帳號：{user.name}\n"
+        f"使用者 ID：{user_id}\n\n"
+        f"要求功能：/{command_name}\n"
+        f"要求時間：{now_str}\n"
+        f"要求來源：{guild_name}\n"
+        f"頻道：{channel_name}\n\n"
+        f"請選擇是否允許這一次操作。"
+    )  # 逐行註解：組對審核 DM 內容。
+    # --- 建立審核 View ---
+    source_channel = interaction.channel  # 逐行註解：保存來源頻道，審核後用來通知。
+    view = SensitiveApprovalView(  # 逐行註解：建立審核 View。
+        pending_key=pending_key,  # 逐行註解：傳入 key。
+        request_id=request_id,  # 逐行註解：傳入審核 ID。
+        requester=user,  # 逐行註解：傳入請求使用者。
+        channel=source_channel,  # 逐行註解：傳入來源頻道。
+    )  # 逐行註解：結束 View 建構。
+    # --- 發送 Sean DM ---
+    try:  # 逐行註解：嘗試發送 DM。
+        approval_msg = await sean_user.send(dm_content, view=view)  # 逐行註解：發送審核訊息給 Sean。
+        view.approval_msg = approval_msg  # 逐行註解：需要把 approval_msg 回寫進 view，讓 Modal 可以更新它。
+        # --- 存入 pending ---
+        PENDING_SENSITIVE_APPROVALS[pending_key] = {  # 逐行註解：存入 pending dict。
+            "request_id": request_id,  # 逐行註解：保存唯一 ID。
+            "timestamp": time.monotonic(),  # 逐行註解：審核發出時間。
+            "channel": source_channel,  # 逐行註解：來源頻道。
+            "user": user,  # 逐行註解：請求使用者。
+        }  # 逐行註解：結束 pending dict。
+        print(f"DEBUG: sensitive approval sent to Sean request_id={request_id}")  # 逐行註解：後台 log。
+    except Exception as e:  # 逐行註解：發送 DM 失敗不崩潰。
+        print(f"DEBUG: cannot notify Sean for sensitive approval (send failed): {e}")  # 逐行註解：後台 log。
 
 
 def should_reply_no_permission_to_message(message: discord.Message) -> bool:  # 逐行註解：定義函式 should_reply_no_permission_to_message，決定一般訊息沒權限時要不要回覆。
@@ -740,6 +965,30 @@ def requested_chart_type_from_text(user_text: str) -> str:  # 逐行註解：從
 def extract_label_value_pairs_from_user_text(user_text: str) -> tuple[list[str], list[float]]:  # 逐行註解：從使用者訊息中抽取「標籤+數字」資料列。
     labels: list[str] = []  # 逐行註解：建立標籤清單。
     values: list[float] = []  # 逐行註解：建立數值清單。
+    pair_pattern = re.compile(r"(?:^|[、,，;；\n])\s*([^:：,，、;；\n]+?)\s*[:：]\s*([-+]?\d+(?:\.\d+)?)%?")  # 逐行註解：支援同一行多組「label: value」資料。
+
+    def _clean_chart_label(raw_label: str) -> str:  # 逐行註解：清理圖表資料標籤，避免把「畫一個」這類指令文字當成標籤。
+        label = (raw_label or "").strip(" -:：,，、;；")
+        label = re.sub(r"^(?:請你|請|麻煩你|麻煩|幫我|幫忙|幫|替我)?\s*", "", label)
+        label = re.sub(r"^(?:畫出|畫一個|畫個|畫|做出|做一個|做個|做|產生|建立|生成|給我|用)\s*", "", label)
+        label = re.sub(r"^(?:一個|一張|張|個)\s*", "", label)
+        label = label.strip(" -:：,，、;；")
+        # 英文資料常見於「畫一個apple:3」，保留最後一段英文標籤。
+        english_tail = re.search(r"([A-Za-z][A-Za-z0-9 _-]*)$", label)
+        if english_tail:
+            label = english_tail.group(1).strip()
+        return label
+
+    for match in pair_pattern.finditer(user_text or ""):  # 逐行註解：先處理同一行用逗號、頓號分隔的多筆資料。
+        label = _clean_chart_label(match.group(1))
+        if not label:
+            continue
+        labels.append(label)
+        values.append(float(match.group(2)))
+
+    if labels:  # 逐行註解：同一行多資料已成功解析時直接回傳。
+        return labels, values
+
     for raw_line in (user_text or "").splitlines():  # 逐行註解：逐行處理使用者輸入。
         line = raw_line.strip()  # 逐行註解：整理每一行頭尾空白。
         if not line:  # 逐行註解：空行不含資料。
@@ -747,7 +996,7 @@ def extract_label_value_pairs_from_user_text(user_text: str) -> tuple[list[str],
         match = re.match(r"^(.+?)[\s:：,，]*([-+]?\d+(?:\.\d+)?)%?\s*$", line)  # 逐行註解：支援「小明80」「小明 80」「小明：80」等格式。
         if not match:  # 逐行註解：沒有匹配到標籤與數字就不是資料列。
             continue  # 逐行註解：跳過非資料列。
-        label = match.group(1).strip(" -:：,，")  # 逐行註解：取出資料標籤並清掉分隔符。
+        label = _clean_chart_label(match.group(1))  # 逐行註解：取出資料標籤並清掉分隔符。
         if not label:  # 逐行註解：空標籤不能畫圖。
             continue  # 逐行註解：跳過無效資料列。
         labels.append(label)  # 逐行註解：保存有效標籤。
@@ -766,7 +1015,13 @@ def build_chart_payload_from_user_text(user_text: str) -> dict | None:  # 逐行
     chart_type = requested_chart_type_from_text(user_text)  # 逐行註解：先確認使用者是否明確要求支援的圖表類型。
     if chart_type not in CHART_TYPE_NAMES:  # 逐行註解：沒有圖表需求就不啟動保底流程。
         return None  # 逐行註解：回傳 None 讓一般聊天維持原流程。
-    labels, values = extract_label_value_pairs_from_user_text(user_text)  # 逐行註解：從使用者訊息抽取資料列。
+    # 逐行註解：優先嘗試新的 parse_chart_text parser，支援多種格式。
+    labels, values = parse_chart_text(user_text)
+    # 逐行註解：如果新 parser 失敗或沒有抓到資料，改用舊的 extract_label_value_pairs_from_user_text。
+    if not labels or len(labels) != len(values):
+        # 逐行註解：新 parser 未能解析，改用舊的 parser。
+        labels, values = extract_label_value_pairs_from_user_text(user_text)
+    # 逐行註解：資料不足時不能畫圖。
     if not labels or len(labels) != len(values):  # 逐行註解：資料不足時不能畫圖。
         return None  # 逐行註解：回傳 None 讓一般回覆維持原流程。
     chart_data = {  # 逐行註解：建立與 AI JSON 相同格式的圖表資料。
@@ -852,6 +1107,77 @@ def parse_chart_reply(raw_text: str) -> dict | None:  # 逐行註解：判斷模
     print(chart_data)  # 逐行註解：除錯輸出，印出已解析的圖表資料。
     debug_json_parsed(chart_data)  # 逐行註解：依需求印出 JSON PARSED 區塊。
     return chart_data  # 逐行註解：回傳標準化後的圖表資料。
+
+
+def extract_all_json_objects(raw_text: str) -> list[str]:  # 逐行註解：從模型回覆中抓出所有可能是 JSON 物件的區塊。
+    cleaned = ANSI_ESCAPE_RE.sub("", (raw_text or "").strip())  # 逐行註解：先移除 ANSI 控制碼與前後空白。
+    results: list[str] = []  # 逐行註解：準備存放找到的所有 JSON 物件文字。
+    decoder = json.JSONDecoder()  # 逐行註解：建立 JSON decoder。
+    idx = 0  # 逐行註解：從字串開頭開始掃描。
+    while idx < len(cleaned):  # 逐行註解：遍歷整個字串內容。
+        if cleaned[idx] == "{":  # 逐行註解：發現左大括號，可能是 JSON 物件起點。
+            try:  # 嘗試從目前位置解析 JSON。
+                data, end_idx = decoder.raw_decode(cleaned[idx:])  # 逐行註解：解析第一個完整的 JSON 值。
+                if isinstance(data, dict):  # 逐行註解：圖表必須是字典格式。
+                    results.append(cleaned[idx:idx + end_idx])  # 逐行註解：擷取該段 JSON 文字並存入結果。
+                idx += end_idx  # 逐行註解：掃描位置跳到該物件結束之後。
+                continue  # 逐行註解：繼續尋找下一個物件。
+            except json.JSONDecodeError:  # 逐行註解：如果目前大括號不是有效 JSON 的起點。
+                pass  # 逐行註解：忽略此位置，繼續往後找。
+        idx += 1  # 逐行註解：掃描位置往後移一個字元。
+    return results  # 逐行註解：回傳所有找到的 JSON 物件文字清單。
+
+
+def parse_all_charts_reply(raw_text: str) -> list[dict]:  # 逐行註解：從 AI 回覆中解析出所有符合圖表格式的資料。
+    json_texts = extract_all_json_objects(raw_text)  # 逐行註解：擷取回覆中所有 JSON 物件文字。
+    payloads = []  # 逐行註解：準備存放驗證通過的圖表資料。
+    for jt in json_texts:  # 逐行註解：逐一檢查每個擷取出的 JSON。
+        try:  # 嘗試進行圖表格式驗證。
+            data = json.loads(jt)  # 逐行註解：將文字轉為字典。
+            if not isinstance(data, dict) or str(data.get("type") or "").lower() != "chart":  # 逐行註解：檢查是否標記為 chart 類型。
+                continue  # 逐行註解：不是圖表就跳過。
+            chart_type = normalize_chart_type_name(data.get("chart_type"))  # 逐行註解：正規化圖表類型（如 bar, line, pie）。
+            if chart_type not in CHART_TYPE_NAMES:  # 逐行註解：檢查是否為支援的圖表類型。
+                continue  # 逐行註解：不支援則跳過。
+            labels = data.get("labels")  # 逐行註解：讀取資料標籤。
+            values = data.get("values")  # 逐行註解：讀取資料數值。
+            if isinstance(labels, list) and isinstance(values, list) and labels and len(labels) == len(values):  # 逐行註解：檢查標籤與數值是否匹配且非空。
+                payloads.append({  # 逐行註解：加入標準化的圖表 payload。
+                    "type": "chart",
+                    "chart_type": chart_type,
+                    "title": str(data.get("title") or CHART_TYPE_NAMES[chart_type]).strip(),
+                    "labels": [str(l).strip() for l in labels],
+                    "values": [float(v) for v in values]
+                })
+        except Exception:  # 逐行註解：忽略個別 JSON 解析失敗的錯誤。
+            continue
+    return payloads  # 逐行註解：回傳所有有效圖表資料清單。
+
+
+async def send_multiple_charts_to_interaction(interaction: discord.Interaction, payloads: list[dict], *, status_message: discord.Message | None = None, ephemeral: bool = False) -> None:  # 逐行註解：將多張圖表一次傳送到 Discord。
+    files = []  # 逐行註解：準備存放圖表圖片檔案物件。
+    summaries = []  # 逐行註解：準備存放每張圖表的完成摘要。
+    for i, payload in enumerate(payloads, start=1):  # 逐行註解：逐一產生每一張圖表圖片。
+        try:  # 嘗試繪製圖表。
+            buffer = make_chart_buffer_from_payload(payload)  # 逐行註解：呼叫 matplotlib 產生圖片緩衝區。
+            files.append(discord.File(buffer, filename=f"chart_{i}.png"))  # 逐行註解：封裝成 Discord 檔案物件。
+            summaries.append(chart_reply_summary(payload))  # 逐行註解：取得該圖表的文字摘要（如：已產生圓餅圖...）。
+        except Exception as e:  # 捕捉繪圖過程的錯誤。
+            print(f"產生第 {i} 張圖表失敗：{type(e).__name__}: {e}")  # 在後台印出錯誤訊息。
+
+    if not files:  # 逐行註解：如果沒有任何圖表產生成功。
+        if status_message:  # 逐行註解：若有進度訊息，更新為錯誤提示。
+            await safe_edit_message(status_message, CHART_PARSE_FAILED_MESSAGE)
+        return  # 結束傳送流程。
+
+    full_summary = "\n".join(summaries)  # 逐行註解：將所有圖表摘要合併為一段文字。
+    if status_message:  # 逐行註解：將原本的「正在等待回答」訊息更新為圖表摘要。
+        await safe_edit_message(status_message, full_summary)
+    
+    if interaction.channel:  # 逐行註解：優先透過頻道發送檔案。
+        await interaction.channel.send(files=files)  # 逐行註解：一次傳送所有產生的圖表。
+    else:  # 逐行註解：若無頻道物件，則使用 followup 備援發送。
+        await interaction.followup.send(files=files, ephemeral=ephemeral)
 
 
 def make_chart_buffer_from_payload(chart_payload: dict) -> io.BytesIO:  # 逐行註解：依 chart_type 呼叫對應的 matplotlib 圖表函式。
@@ -989,27 +1315,64 @@ def get_conversation_memory(user_id: int, model: str) -> list[dict[str, str]]:  
     return conversation_memory.get((user_id, model), [])  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
 
 
-def format_conversation_memory(user_id: int, model: str) -> str:  # 逐行註解：定義函式 format_conversation_memory，把一段會重複使用的流程包起來。
-    """把共享記憶和目前模型記憶整理進 prompt；不限制輪次，只塞到 max token 預算附近。"""  # 逐行註解：說明這裡會同時讀共享記憶和目前模型自己的記憶。
-    shared_history = get_conversation_memory(user_id, SHARED_MEMORY_MODEL)  # 逐行註解：先取出這位使用者的共享記憶，例如之前 web_search 查到的內容。
-    model_history = [] if model == SHARED_MEMORY_MODEL else get_conversation_memory(user_id, model)  # 逐行註解：再取目前模型自己的記憶；如果本來就在讀共享記憶，就避免重複讀一次。
-    history = shared_history + model_history  # 逐行註解：把共享記憶放前面、模型自己的記憶放後面，讓所有模型都能接續 web_search 的上下文。
-    if not history:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
-        return "無"  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
+def memory_role_name(role: str) -> str:
+    """把內部 role 名稱轉成 prompt 裡更好懂的繁中標籤。"""
+    if role == "user":
+        return "使用者"
+    if role == "summary":
+        return "Summary memory"
+    return "AI"
 
-    lines: list[str] = []  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
-    used_chars = 0  # 逐行註解：設定 used_chars 這個變數，供後面的流程使用。
-    for item in reversed(history):  # 逐行註解：用迴圈逐一處理清單、字典或其他可迭代資料。
-        role = "使用者" if item.get("role") == "user" else "AI"  # 逐行註解：執行這一行，推進 Discord bot、Ollama 或網頁搜尋流程。
-        content = (item.get("content") or "").strip()  # 逐行註解：設定 content 這個變數，供後面的流程使用。
-        if content:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
-            line = f"{role}：{content}"  # 逐行註解：設定 line 這個變數，供後面的流程使用。
-            used_chars += len(line)  # 逐行註解：執行這一行，推進 Discord bot、Ollama 或網頁搜尋流程。
-            if used_chars > CONVERSATION_MEMORY_MAX_CHARS:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
-                break  # 逐行註解：提前跳出目前這個迴圈。
-            lines.append(line)  # 逐行註解：執行這一行，推進 Discord bot、Ollama 或網頁搜尋流程。
-    lines.reverse()  # 逐行註解：執行這一行，推進 Discord bot、Ollama 或網頁搜尋流程。
-    return "\n".join(lines) if lines else "無"  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
+
+def format_memory_history(
+    history: list[dict[str, str]],
+    *,
+    source_label: str,
+    remaining_chars: int,
+) -> tuple[str, int]:
+    """把某一段 memory history 轉成文字，並回傳實際使用字數。"""
+    if remaining_chars <= 0:
+        return "", 0
+    lines: list[str] = []
+    used_chars = 0
+    for item in reversed(history):
+        role = memory_role_name(item.get("role") or "")
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        line = f"[{source_label}] {role}：{content}"
+        if used_chars + len(line) > remaining_chars:
+            break
+        lines.append(line)
+        used_chars += len(line)
+    lines.reverse()
+    return "\n".join(lines), used_chars
+
+
+def format_conversation_memory(user_id: int, model: str) -> str:  # 逐行註解：定義函式 format_conversation_memory，把一段會重複使用的流程包起來。
+    """把 summary、共享記憶和目前模型記憶整理進 prompt，讓任何 AI 回覆都可被後續讀到。"""
+    sections: list[str] = []
+    used_chars = 0
+
+    memory_sources = [
+        ("summary memory（整理後，優先參考）", get_conversation_memory(user_id, SUMMARY_MEMORY_MODEL)),
+        ("shared memory（跨模型工具結果）", get_conversation_memory(user_id, SHARED_MEMORY_MODEL)),
+    ]
+    if model not in {SUMMARY_MEMORY_MODEL, SHARED_MEMORY_MODEL}:
+        memory_sources.append((f"{model} chat history", get_conversation_memory(user_id, model)))
+
+    for source_label, history in memory_sources:
+        remaining_chars = CONVERSATION_MEMORY_MAX_CHARS - used_chars
+        section_text, section_chars = format_memory_history(
+            history,
+            source_label=source_label,
+            remaining_chars=remaining_chars,
+        )
+        if section_text:
+            sections.append(section_text)
+            used_chars += section_chars
+
+    return "\n".join(sections) if sections else "無"  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
 
 
 def format_permanent_memory_for_prompt(user_id: int) -> str:  # 逐行註解：把目前使用者自己的永久記憶整理成可放進 Ollama prompt 的文字。
@@ -1040,31 +1403,15 @@ def build_prompt_with_memory(user_id: int, model: str, user_text: str) -> str:  
     chart_rules = chart_output_rules_prompt()  # 逐行註解：取得圖表 JSON 規則，讓聊天需要視覺化時可觸發圖表輸出。
 
     return f"""
-【AI 身份規則】
-你是 Smart_Sean AI。
-你的名字是 Smart_Sean。
-你不是 Discord 使用者。
-你不能把使用者的姓名、暱稱、設備、偏好或個人資料說成是你自己的資料。
-
-【使用者身份規則】
-永久記憶與短期對話記憶都屬於「Discord 使用者」。
-永久記憶來自 /remember，代表使用者要求你長期記住的使用者資料。
-當使用者問「我是誰」「我叫什麼」「我的名字是什麼」時，請思考永久記憶中的使用者資料，並用「你」回答使用者。
-當使用者問「你是誰」「你叫什麼」「你的名字是什麼」時，請思考 AI 身份規則，回答你是 Smart_Sean AI。
-
-【身份分離範例】
-永久記憶如果寫著：「使用者叫做陳宥翔」
-使用者問：「我是誰」
-正確回答：「根據我的記憶，你是陳宥翔。」
-使用者問：「你是誰」
-正確回答：「我是 Smart_Sean AI。」
-錯誤回答：「我是陳宥翔。」
-
-【回答規則】
-回答前先判斷問題是在問「使用者」還是在問「AI」。
-問使用者身份時，使用使用者記憶。
-問 AI 身份時，使用 Smart_Sean AI 身份。
-禁止把使用者姓名當成 AI 姓名。
+【身份判斷原則】
+你是 Smart_Sean AI，不是 Discord 使用者。
+永久記憶和短期對話記憶都屬於目前這位 Discord 使用者，不是你的個人資料。
+中文第一人稱「我、我的、我是誰、我叫什麼」指的是 Discord 使用者本人；中文第二人稱「你、你的、你是誰、你叫什麼」指的是 AI 助理。
+回答任何身份、姓名、偏好、設備或個人資料問題前，先自行判斷使用者是在問「使用者本人」還是在問「AI 助理」。
+如果問題是在問使用者本人，請到永久記憶和短期對話記憶裡找可用資料，再用第二人稱回答；沒有足夠記憶時，直接說目前記憶不足。
+如果問題是在問 AI 助理，請根據你的 AI 身份回答，不要引用使用者的姓名、暱稱、設備或偏好當成你的資料。
+沒有明確資料來源時，不要編造你的製作者、公司、模型來源或產品背景。
+不要套用固定句型；每次都根據使用者的新訊息和下方記憶內容自行整理答案。
 
 【圖表輸出規則】
 {chart_rules}
@@ -1080,6 +1427,176 @@ def build_prompt_with_memory(user_id: int, model: str, user_text: str) -> str:  
 """.strip()
 
 
+def normalize_identity_query(text: str) -> str:
+    """把身份問題整理成容易比對的字串。"""
+    return re.sub(r"[\s，,。.!！?？；;：:「」『』\"'`~～（）()【】\\[\\]]+", "", (text or "").strip().lower())
+
+
+def identity_question_target(user_text: str) -> str:
+    """判斷身份問題是在問使用者本人還是 AI 助理；不是身份問題就回空字串。"""
+    text = normalize_identity_query(user_text)
+    if not text:
+        return ""
+    user_identity_phrases = (
+        "我是誰",
+        "我是谁",
+        "我叫什麼",
+        "我叫什么",
+        "我的名字是什麼",
+        "我的名字是什么",
+        "我的名稱是什麼",
+        "我的名稱是什么",
+        "你知道我是誰",
+        "你記得我是誰",
+        "你還記得我是誰",
+        "記得我是誰",
+        "還記得我是誰",
+        "whoami",
+        "whatismyname",
+    )
+    if any(phrase in text for phrase in user_identity_phrases):
+        return "user"
+    ai_identity_phrases = (
+        "你是誰",
+        "你是谁",
+        "你叫什麼",
+        "你叫什么",
+        "你的名字是什麼",
+        "你的名字是什么",
+        "你的名稱是什麼",
+        "你的名稱是什么",
+        "whoareyou",
+        "whatisyourname",
+    )
+    if any(phrase in text for phrase in ai_identity_phrases):
+        return "ai"
+    return ""
+
+
+def user_memory_lookup_requested(user_text: str) -> bool:
+    """判斷使用者是不是在問 bot 目前記得哪些使用者資料。"""
+    text = normalize_identity_query(user_text)
+    if not text:
+        return False
+    if identity_question_target(user_text) == "ai":
+        return False
+    lookup_phrases = (
+        "你還記得我嗎",
+        "你記得我嗎",
+        "還記得我嗎",
+        "記得我嗎",
+        "你認識我嗎",
+        "認識我嗎",
+        "你知道我嗎",
+        "知道我嗎",
+        "你知道我的資料嗎",
+        "你有我的資料嗎",
+        "你有我的記憶嗎",
+        "我的記憶有什麼",
+        "我的記憶有哪些",
+        "你記得我的什麼",
+        "你記得我什麼",
+        "你對我有什麼記憶",
+        "你知道哪些關於我",
+        "你知道關於我的什麼",
+        "你目前記得什麼",
+        "你記憶裡有什麼",
+        "列出我的記憶",
+        "顯示我的記憶",
+    )
+    return any(phrase in text for phrase in lookup_phrases)
+
+
+def memory_content_to_second_person(content: str) -> str:
+    """把 memories JSON 裡的「使用者...」改成回答使用者時自然的第二人稱。"""
+    text = (content or "").strip()
+    replacements = (
+        (r"^使用者名稱為", "你的名稱是"),
+        (r"^使用者名字為", "你的名字是"),
+        (r"^使用者叫做", "你叫做"),
+        (r"^使用者叫", "你叫"),
+        (r"^使用者是", "你是"),
+        (r"^使用者使用", "你使用"),
+    )
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    if text.startswith("使用者"):
+        text = "你" + text[len("使用者"):]
+    return text
+
+
+def collect_user_memory_answer_items(user_id: int, *, include_short_term: bool = True) -> list[str]:
+    """收集可直接回答使用者的記憶內容，永久記憶優先，必要時補短期記憶。"""
+    items: list[str] = []
+    seen: set[str] = set()
+
+    for item in load_permanent_memories(user_id):
+        content = str(item.get("content") or "").strip()
+        normalized = normalize_memory_content(content)
+        if not content or not normalized or normalized in seen:
+            continue
+        items.append(memory_content_to_second_person(content))
+        seen.add(normalized)
+
+    if include_short_term:
+        for model in (SUMMARY_MEMORY_MODEL, SHARED_MEMORY_MODEL):
+            for item in get_conversation_memory(user_id, model):
+                content = str(item.get("content") or "").strip()
+                normalized = normalize_memory_content(content)
+                if not content or not normalized or normalized in seen:
+                    continue
+                items.append(memory_content_to_second_person(content))
+                seen.add(normalized)
+                if len(items) >= 8:
+                    return items
+
+    return items[:8]
+
+
+def identity_memory_contents(user_id: int) -> list[str]:
+    """從永久記憶優先找出使用者身份相關內容。"""
+    identity_keywords = ("名稱", "名字", "叫做", "叫", "身份", "身分", "我是", "生日", "年齡", "設備", "mac", "電腦", "discord", "帳號")
+    contents: list[str] = []
+    seen: set[str] = set()
+    for item in load_permanent_memories(user_id):
+        content = str(item.get("content") or "").strip()
+        normalized = normalize_memory_content(content)
+        lowered = content.lower()
+        if not content or not normalized or normalized in seen:
+            continue
+        if any(keyword.lower() in lowered for keyword in identity_keywords):
+            contents.append(memory_content_to_second_person(content))
+            seen.add(normalized)
+    return contents
+
+
+def build_identity_answer(user_id: int, user_text: str) -> str:
+    """身份問題不交給一般聊天模型猜，避免把使用者和 AI 身份混在一起。"""
+    target = identity_question_target(user_text)
+    if target == "ai":
+        return "我是 Smart_Sean AI。"
+    if target != "user":
+        return ""
+    contents = identity_memory_contents(user_id)
+    if not contents:
+        return "我目前沒有足夠的永久記憶判斷你是誰。"
+    if len(contents) == 1:
+        return f"根據永久記憶，{contents[0]}"
+    bullet_lines = "\n".join(f"- {content}" for content in contents[:5])
+    return f"根據永久記憶，我目前知道：\n{bullet_lines}"
+
+
+def build_user_memory_lookup_answer(user_id: int, user_text: str) -> str:
+    """記憶查詢不交給小模型猜，直接從 memories JSON 和短期記錄回答。"""
+    if not user_memory_lookup_requested(user_text):
+        return ""
+    items = collect_user_memory_answer_items(user_id)
+    if not items:
+        return "我目前沒有可用的永久記憶或短期聊天記錄。"
+    bullet_lines = "\n".join(f"- {item}" for item in items)
+    return f"我目前記得：\n{bullet_lines}"
+
+
 def remember_conversation(user_id: int, model: str, user_text: str, assistant_text: str) -> None:  # 逐行註解：定義函式 remember_conversation，把一段會重複使用的流程包起來。
     """保存使用者訊息與 AI 回覆；一般聊天按模型分開記，web_search 可存進共享記憶。"""  # 逐行註解：說明記憶可以分模型保存，也可以保存到共享記憶給所有模型使用。
     user_text = (user_text or "").strip()  # 逐行註解：設定 user_text 這個變數，供後面的流程使用。
@@ -1089,10 +1606,184 @@ def remember_conversation(user_id: int, model: str, user_text: str, assistant_te
 
     key = (user_id, model)  # 逐行註解：設定 key 這個變數，供後面的流程使用。
     history = conversation_memory.setdefault(key, [])  # 逐行註解：設定 history 這個變數，供後面的流程使用。
+    entry_max_chars = SUMMARY_MEMORY_ENTRY_MAX_CHARS if model == SUMMARY_MEMORY_MODEL else CONVERSATION_MEMORY_ENTRY_MAX_CHARS
     if user_text:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
-        history.append({"role": "user", "content": user_text[:CONVERSATION_MEMORY_ENTRY_MAX_CHARS]})  # 逐行註解：保存使用者訊息，但最多保留設定好的單筆字數，避免記憶爆太大。
+        history.append({"role": "user", "content": user_text[:entry_max_chars]})  # 逐行註解：保存使用者訊息，但最多保留設定好的單筆字數，避免記憶爆太大。
     if assistant_text:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
-        history.append({"role": "assistant", "content": assistant_text[:CONVERSATION_MEMORY_ENTRY_MAX_CHARS]})  # 逐行註解：保存 AI 回覆，web_search 長回答也能保留更多內容。
+        role = "summary" if model == SUMMARY_MEMORY_MODEL else "assistant"
+        history.append({"role": role, "content": assistant_text[:entry_max_chars]})  # 逐行註解：保存 AI 回覆，web_search 長回答也能保留更多內容。
+
+
+def iter_user_memory_records(user_id: int) -> list[tuple[str, str, str]]:
+    """列出指定使用者目前保留的所有短期、共享、summary 和永久記憶。"""
+    records: list[tuple[str, str, str]] = []
+    for (stored_user_id, model), history in conversation_memory.items():
+        if stored_user_id != user_id:
+            continue
+        for item in history:
+            content = (item.get("content") or "").strip()
+            if content:
+                records.append((model, item.get("role") or "assistant", content))
+    for item in load_permanent_memories(user_id):
+        content = str(item.get("content") or "").strip()
+        if content:
+            records.append(("permanent memory", "summary", content))
+    return records
+
+
+def count_user_memory_records(user_id: int) -> int:
+    """計算指定使用者有多少筆聊天記錄可整理。"""
+    return len(iter_user_memory_records(user_id))
+
+
+def format_user_memory_for_summary(user_id: int) -> str:
+    """把全部聊天記錄整理成 gemma4_thinking 用來產生 summary memory 的輸入。"""
+    records = iter_user_memory_records(user_id)
+    if not records:
+        return ""
+
+    summary_records = [record for record in records if record[0] == SUMMARY_MEMORY_MODEL]
+    permanent_records = [record for record in records if record[0] == "permanent memory"]
+    raw_records = [record for record in records if record[0] not in {SUMMARY_MEMORY_MODEL, "permanent memory"}]
+    ordered_records = summary_records + permanent_records + list(reversed(raw_records))
+
+    lines: list[str] = []
+    used_chars = 0
+    for model, role, content in ordered_records:
+        line = f"[{model}] {memory_role_name(role)}：{content}"
+        if used_chars + len(line) > SUMMARY_MEMORY_SOURCE_MAX_CHARS:
+            break
+        lines.append(line)
+        used_chars += len(line)
+    return "\n".join(lines)
+
+
+def build_summary_memory_prompt(memory_context: str) -> str:
+    """建立 summary memory 專用 prompt；呼叫端固定用 gemma4_thinking。"""
+    return f"""
+你是 Discord bot 的 summary memory 整理器。
+你必須把聊天記錄整理成可以寫回 memories/<user_id>.json 的永久記憶項目。
+
+規則：
+1. 使用繁體中文。
+2. 每一筆 content 都要是完整、清楚、單句或短句的使用者記憶，讓小模型不用推理太多也能理解。
+3. 重複、相似或互相包含的內容要自動合併，不要逐字堆疊。
+4. 如果新內容修正舊內容，以新內容為準，直接改寫成最新版本。
+5. 刪掉寒暄、無後續價值的中間過程、重複失敗訊息和不重要細節。
+6. content 要使用原本 memories JSON 的記憶寫法，優先以「使用者...」開頭，不要寫成「Summary memory:」或分類標題。
+7. 不要把 AI 身份、AI 規則或 Smart_Sean AI 寫成使用者資料。
+8. 最多輸出 12 筆，每筆 content 盡量 120 字以內。
+9. 只能輸出 JSON，不要輸出 Markdown、thinking process、整理理由、前言或結語。
+
+輸出格式：
+{{"memories":[{{"content":"使用者..."}}]}}
+
+聊天記錄：
+{memory_context}
+""".strip()
+
+
+def normalize_summary_memory_content(content: str) -> str:
+    """把 summary model 產生的內容整理成單筆 memories JSON content。"""
+    cleaned = clean_memory_request_content(content, MEMORY_SUGGESTION_MAX_CHARS)
+    cleaned = re.sub(r"^(?:content|記憶|memory)\s*[:：]\s*", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"^(?:使用者偏好|目前任務|重要上下文|工具或搜尋結果|注意事項)\s*[:：]\s*", "使用者", cleaned).strip()
+    if not cleaned:
+        return ""
+    if cleaned.lower() in {"summary memory", "memories"}:
+        return ""
+    if not cleaned.startswith("使用者"):
+        cleaned = f"使用者{cleaned}"
+    return cleaned[:MEMORY_SUGGESTION_MAX_CHARS].rstrip()
+
+
+def parse_summary_memory_items(raw_text: str) -> list[str]:
+    """解析 gemma4_thinking 輸出的 summary memory，回傳可寫入 memories JSON 的 content 清單。"""
+    text = (raw_text or "").strip()
+    if not text:
+        return []
+    cleaned = re.sub(r"(?is)^```(?:json)?\s*|\s*```$", "", text).strip()
+    parsed_data = None
+    for candidate in (cleaned, extract_first_json_object_text(cleaned)):
+        if not candidate:
+            continue
+        try:
+            parsed_data = json.loads(candidate)
+            break
+        except Exception:
+            continue
+    if parsed_data is None:
+        array_match = re.search(r"\[.*\]", cleaned, flags=re.S)
+        if array_match:
+            try:
+                parsed_data = json.loads(array_match.group(0))
+            except Exception:
+                parsed_data = None
+
+    raw_items: list[str] = []
+    if isinstance(parsed_data, dict):
+        memories = parsed_data.get("memories") or parsed_data.get("memory") or parsed_data.get("items") or []
+        if isinstance(memories, list):
+            for item in memories:
+                if isinstance(item, dict):
+                    raw_items.append(str(item.get("content") or "").strip())
+                elif isinstance(item, str):
+                    raw_items.append(item.strip())
+    elif isinstance(parsed_data, list):
+        for item in parsed_data:
+            if isinstance(item, dict):
+                raw_items.append(str(item.get("content") or "").strip())
+            elif isinstance(item, str):
+                raw_items.append(item.strip())
+
+    if not raw_items:
+        for line in cleaned.splitlines():
+            line = line.strip()
+            line = re.sub(r"^[-*•]\s*", "", line)
+            line = re.sub(r"^\d+[.)、]\s*", "", line)
+            if not line or line.lower().startswith(("summary memory", "```")):
+                continue
+            raw_items.append(line)
+
+    contents: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        content = normalize_summary_memory_content(item)
+        normalized = normalize_memory_content(content)
+        if not content or not normalized or normalized in seen:
+            continue
+        contents.append(content)
+        seen.add(normalized)
+        if len(contents) >= 12:
+            break
+    return contents
+
+
+def replace_permanent_memories_with_summary(user_id: int, contents: list[str]) -> list[dict]:
+    """用 summary_memory 整理後的內容覆蓋永久記憶，格式維持 memories JSON。"""
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    items = [build_memory_json_item(index + 1, content, created_at) for index, content in enumerate(contents)]
+    save_permanent_memories(user_id, items)
+    upsert_summary_memory(user_id, format_memory_json_items(items))
+    return items
+
+
+def upsert_summary_memory(user_id: int, summary_text: str) -> None:
+    """只更新 summary memory，不刪 raw chat history。"""
+    summary_text = (summary_text or "").strip()
+    if not summary_text:
+        return
+    conversation_memory[(user_id, SUMMARY_MEMORY_MODEL)] = [
+        {"role": "summary", "content": summary_text[:SUMMARY_MEMORY_ENTRY_MAX_CHARS]}
+    ]
+
+
+def clear_user_conversation_memory(user_id: int) -> int:
+    """清空指定使用者的聊天記錄，回傳刪掉的記錄區數量。"""
+    keys_to_delete = [key for key in conversation_memory if key[0] == user_id]
+    for key in keys_to_delete:
+        del conversation_memory[key]
+    return len(keys_to_delete)
 
 
 class DuckDuckGoResultParser(HTMLParser):  # 逐行註解：定義類別 DuckDuckGoResultParser，用來描述一種資料或 Discord UI 元件。
@@ -1348,6 +2039,49 @@ async def fetch_web_pages(  # 逐行註解：定義非同步函式 fetch_web_pag
     def _fetch_one(item: dict[str, str]) -> dict[str, str]:  # 逐行註解：定義函式 _fetch_one，把一段會重複使用的流程包起來。
         url = item["url"]  # 逐行註解：設定 url 這個變數，供後面的流程使用。
         try:  # 逐行註解：開始嘗試執行可能會失敗的程式碼，方便後面捕捉錯誤。
+            # 先取得網頁 HTML 內容，尋找資料下載連結。
+            html = dataset_utils.fetch_html(url)  # 逐行註解：取得該網址的 HTML 內容。
+            data_links = dataset_utils.extract_data_links(html, url) if html else []  # 逐行註解：從 HTML 中找出可能的資料檔下載連結。
+            
+            if data_links:  # 逐行註解：如果網頁中包含資料檔連結。
+                print(f"DEBUG: 找到 {len(data_links)} 個資料連結於 {url}")  # 逐行註解：後台輸出日誌。
+                # 嘗試前 5 個連結。
+                for i, link_info in enumerate(data_links[:dataset_utils.MAX_DATA_LINKS_TO_TRY]):  # 逐行註解：限制嘗試次數。
+                    d_url = link_info["url"]  # 逐行註解：取得下載網址。
+                    f_type = link_info["type"]  # 逐行註解：取得檔案類型（csv, json, xlsx 等）。
+                    print(f"DEBUG: 嘗試下載第 {i+1} 個資料檔：{d_url} (類型: {f_type})")  # 逐行註解：輸出日誌。
+                    
+                    data_bytes, status = dataset_utils.download_data_safely(d_url)  # 逐行註解：安全下載檔案位元組。
+                    if not data_bytes:  # 逐行註解：如果下載失敗。
+                        print(f"DEBUG: 下載失敗：{status}")  # 逐行註解：輸出日誌。
+                        # 將失敗資訊帶回，讓 AI 能告知使用者。
+                        return {**item, "status": f"下載資料檔失敗 ({f_type.upper()})", "text": f"找到資料檔連結但下載失敗。\n網址：{d_url}\n原因：{status}", "auto_charts": []}
+                    
+                    df = dataset_utils.read_table_safely(data_bytes, f_type)  # 逐行註解：從記憶體讀取表格。
+                    if df is not None and not df.empty:  # 逐行註解：如果成功讀取且有資料。
+                        print(f"DEBUG: 成功讀取表格，形狀：{df.shape}，欄位：{df.columns.tolist()}")  # 逐行註解：輸出日誌。
+                        info = dataset_utils.infer_columns(df, q)  # 逐行註解：動態推論欄位意義。
+                        
+                        # 核心邏輯：自動偵測是否可產生特定圖表。
+                        auto_payloads = []  # 逐行註解：準備存放自動產生的圖表。
+                        if any(info.get(k) for k in ["young", "total"]):  # 逐行註解：如果像是人口相關資料。
+                            auto_payloads = dataset_utils.process_population_charts(df, info)  # 逐行註解：處理人口圓餅圖與折線圖。
+                        
+                        summary = dataset_utils.summarize_generic_data(df, info)  # 逐行註解：產生資料摘要供 AI 文字說明。
+                        
+                        # 清理大型物件參考。
+                        del df  # 逐行註解：釋放 DataFrame 記憶體。
+                        
+                        return {  # 逐行註解：回傳包含資料摘要與自動圖表的結果。
+                            **item, 
+                            "status": f"已成功解析 {f_type.upper()} ({d_url})", 
+                            "text": summary,
+                            "auto_charts": auto_payloads  # 逐行註解：將產生的圖表 payload 帶回。
+                        }
+                    # 釋放位元組緩衝區。
+                    del data_bytes  # 逐行註解：釋放下載資料。
+
+            # 若非資料集頁面，則走一般網頁文字讀取流程。
             req = urlrequest.Request(  # 逐行註解：開始一個跨多行的函式呼叫，下面幾行會放參數。
                 url,  # 逐行註解：這行是跨行資料或參數的一個項目。
                 headers={"User-Agent": "Mozilla/5.0"},  # 逐行註解：設定 headers 這個變數，供後面的流程使用。
@@ -1687,10 +2421,42 @@ async def send_interaction_embed_pages(interaction: discord.Interaction, embeds:
         first = False  # 逐行註解：第一頁送完後，後面固定用 followup。
 
 
+def clean_memory_request_content(content: str, max_chars: int = MEMORY_SUGGESTION_MAX_CHARS) -> str:
+    """整理使用者要求記憶的原始內容，但不改成 AI 自己的身份。"""
+    cleaned = (content or "").strip()
+    cleaned = re.sub(r"^[：:，,。.!！\s]+", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars].rstrip()
+    return cleaned
+
+
+def extract_temporary_memory_candidate(user_text: str) -> str:
+    """抓出「暫時記得」這類只要放進短期聊天記錄的內容。"""
+    text = (user_text or "").strip()
+    if not text:
+        return ""
+    patterns = (
+        r"^(?:請你|請|麻煩你|麻煩|幫我|幫忙|替我)?\s*(?:先|暫時|短期)\s*(?:記住|記得|記憶|記錄|記下)\s*[:：]?\s*(.+)$",
+        r"^(?:請你|請|麻煩你|麻煩|幫我|幫忙|替我)?\s*(?:記住|記得|記憶|記錄|記下).{0,8}(?:暫時|短期|這段聊天|這次聊天)\s*[:：]?\s*(.+)$",
+        r"^(?:temporarily remember|remember temporarily|keep this temporarily|temporary memory)\s*[:：]?\s*(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if not match:
+            continue
+        content = clean_memory_request_content(match.group(1), CONVERSATION_MEMORY_ENTRY_MAX_CHARS)
+        if content:
+            return content
+    return ""
+
+
 def user_text_has_memory_request(user_text: str) -> bool:  # 逐行註解：判斷使用者是否明確要求 AI 記住內容，避免每次聊天都跳記憶選單。
     text = (user_text or "").strip().lower()  # 逐行註解：整理使用者訊息並轉成小寫，方便比對中英文記憶關鍵字。
     if not text:  # 逐行註解：空訊息不可能是記憶要求。
         return False  # 逐行註解：回傳 False，表示不要觸發記憶判斷。
+    if extract_temporary_memory_candidate(user_text):  # 逐行註解：暫時記憶只寫短期聊天記錄，不跳永久記憶確認。
+        return False  # 逐行註解：避免「暫時記得」又被問要不要寫永久記憶。
     memory_question_patterns = (  # 逐行註解：列出含有記憶字眼但其實是在問問題的常見說法。
         r"(記憶|記得).*(嗎|嘛|什麼|甚麼|哪些|哪個|誰|有沒有|是否|能不能|會不會)",  # 逐行註解：支援「你有記憶嗎」「記憶裡有什麼」這類問題。
         r"(列出|顯示|查看|查詢|查|讀取|回想|recall|list|show).*(記憶|memory)",  # 逐行註解：支援要求查看記憶，不代表要新增記憶。
@@ -1800,6 +2566,25 @@ def parse_memory_judgement(raw_text: str) -> dict:  # 逐行註解：解析 AI �
     return {"should_remember": should_remember and bool(content), "content": content}  # 逐行註解：只有 AI 判斷要記且內容非空時才回傳 True。
 
 
+def build_memory_json_item(memory_id: int, content: str, created_at: str | None = None) -> dict:
+    """建立和 memories/<user_id>.json 相同欄位的記憶項目。"""
+    return {
+        "id": int(memory_id),
+        "content": str(content or "").strip(),
+        "created_at": created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def format_memory_json_items(items: list[dict]) -> str:
+    """用固定 JSON 格式顯示記憶預覽，讓顯示和寫入格式一致。"""
+    return json.dumps(items, ensure_ascii=False, indent=2)
+
+
+def format_memory_json_code_block(items: list[dict]) -> str:
+    """把記憶 JSON 包成 Discord code block。"""
+    return f"```json\n{format_memory_json_items(items)}\n```"
+
+
 def build_memory_judgement_prompt(user_text: str, assistant_text: str) -> str:  # 逐行註解：建立讓 AI 自己判斷是否需要跳出記憶確認的 prompt。
     clipped_user_text = (user_text or "").strip()[:2000]  # 逐行註解：限制使用者訊息長度，避免判斷 prompt 過長。
     clipped_assistant_text = (assistant_text or "").strip()[:1200]  # 逐行註解：保留 AI 回答摘要給判斷器參考，但不讓它太長。
@@ -1837,10 +2622,11 @@ async def judge_memory_suggestion(model: str, user_text: str, assistant_text: st
 
 
 class MemorySuggestionView(discord.ui.View):  # 逐行註解：建立記憶確認按鈕，讓使用者決定是否真的寫入永久記憶。
-    def __init__(self, user_id: int, content: str):  # 逐行註解：初始化記憶確認 View，記住使用者 ID 和候選記憶內容。
+    def __init__(self, user_id: int, content: str, preview_item: dict | None = None):  # 逐行註解：初始化記憶確認 View，記住使用者 ID 和候選記憶內容。
         super().__init__(timeout=180)  # 逐行註解：按鈕 180 秒後自動失效。
         self.user_id = user_id  # 逐行註解：保存可操作這組按鈕的 Discord 使用者 ID。
         self.content = (content or "").strip()[:MEMORY_SUGGESTION_MAX_CHARS]  # 逐行註解：保存候選永久記憶內容並限制長度。
+        self.preview_item = preview_item or build_memory_json_item(0, self.content)  # 逐行註解：保存按鈕訊息顯示用的 memories JSON 格式。
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:  # 逐行註解：限制只有原本使用者能按記憶確認按鈕。
         if interaction.user.id != self.user_id:  # 逐行註解：如果不是原本使用者，就拒絕操作。
@@ -1852,20 +2638,32 @@ class MemorySuggestionView(discord.ui.View):  # 逐行註解：建立記憶確�
     async def remember_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # 逐行註解：處理使用者按下「要」。
         memories = load_permanent_memories(self.user_id)  # 逐行註解：讀取目前使用者自己的永久記憶清單。
         memory_id = next_permanent_memory_id(memories)  # 逐行註解：計算下一個永久記憶編號。
-        item = {"id": memory_id, "content": self.content, "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}  # 逐行註解：建立符合 JSON 格式的新記憶。
+        item = build_memory_json_item(memory_id, self.content)  # 逐行註解：建立符合 memories JSON 格式的新記憶。
         memories.append(item)  # 逐行註解：把新記憶加入清單。
         save_permanent_memories(self.user_id, memories)  # 逐行註解：寫回使用者專屬 JSON 檔。
         for child in self.children:  # 逐行註解：保存後停用所有按鈕，避免重複寫入。
             child.disabled = True  # 逐行註解：停用這個按鈕。
-        await interaction.response.edit_message(content=f"✅ 已儲存記憶\n\n編號：{memory_id}\n\n內容：\n{self.content}", view=self)  # 逐行註解：把原本確認訊息改成保存成功。
+        await interaction.response.edit_message(content=f"✅ 已寫入 memories JSON：\n{format_memory_json_code_block([item])}", view=self)  # 逐行註解：把原本確認訊息改成保存成功。
         self.stop()  # 逐行註解：停止 View 等待。
 
     @discord.ui.button(label="不要", style=discord.ButtonStyle.secondary)  # 逐行註解：建立取消保存記憶的按鈕。
     async def forget_button(self, interaction: discord.Interaction, button: discord.ui.Button):  # 逐行註解：處理使用者按下「不要」。
         for child in self.children:  # 逐行註解：取消後停用所有按鈕。
             child.disabled = True  # 逐行註解：停用這個按鈕。
-        await interaction.response.edit_message(content=f"已取消記憶：\n{self.content}", view=self)  # 逐行註解：把原本確認訊息改成取消狀態。
+        await interaction.response.edit_message(content=f"已取消寫入 memories JSON：\n{format_memory_json_code_block([self.preview_item])}", view=self)  # 逐行註解：把原本確認訊息改成取消狀態。
         self.stop()  # 逐行註解：停止 View 等待。
+
+
+async def send_memory_confirmation_offer(user_id: int, content: str, send_offer) -> None:
+    """用固定 memories JSON 格式顯示永久記憶確認選單。"""
+    content = (content or "").strip()
+    if not content:
+        return
+    memories = load_permanent_memories(user_id)
+    preview_item = build_memory_json_item(next_permanent_memory_id(memories), content)
+    duplicate_hint = "\n（建議不要，因為已經有此記憶）" if permanent_memory_exists(user_id, content) else ""
+    view = MemorySuggestionView(user_id, content, preview_item=preview_item)
+    await send_offer(f"要不要寫入 memories JSON：\n{format_memory_json_code_block([preview_item])}{duplicate_hint}", view)
 
 
 async def maybe_offer_memory_suggestion(user_id: int, model: str, user_text: str, assistant_text: str, send_offer):  # 逐行註解：AI 回答後判斷是否要跳出永久記憶確認選單。
@@ -1876,9 +2674,7 @@ async def maybe_offer_memory_suggestion(user_id: int, model: str, user_text: str
         content = extract_explicit_memory_candidate(user_text)  # 逐行註解：從「記憶我會寫」這類句子抓出候選記憶，避免按鈕消失。
     if not content:  # 逐行註解：如果 AI 判斷不需要記憶，就不打擾使用者。
         return  # 逐行註解：結束記憶確認流程。
-    duplicate_hint = "\n（建議不要，因為已經有此記憶）" if permanent_memory_exists(user_id, content) else ""  # 逐行註解：如果候選記憶已存在，仍然詢問，但附上建議不要重複保存。
-    view = MemorySuggestionView(user_id, content)  # 逐行註解：建立記憶確認按鈕。
-    await send_offer(f"要不要記憶：\n{content}{duplicate_hint}", view)  # 逐行註解：送出確認選單，使用者按要才真的寫入 JSON。
+    await send_memory_confirmation_offer(user_id, content, send_offer)  # 逐行註解：用 memories JSON 格式顯示確認選單，使用者按要才真的寫入 JSON。
 
 
 async def offer_memory_suggestion_after_answer(user_id: int, model: str, user_text: str, assistant_text: str, send_offer):  # 逐行註解：確保 AI 正式回答送完後，才開始處理記憶確認。
@@ -2723,10 +3519,10 @@ async def remember_command(interaction: discord.Interaction, content: str):  # �
         return  # 逐行註解：停止指令。
     memories = load_permanent_memories(interaction.user.id)  # 逐行註解：只讀取目前使用者自己的永久記憶檔。
     memory_id = next_permanent_memory_id(memories)  # 逐行註解：取得下一個可用編號。
-    item = {"id": memory_id, "content": cleaned_content, "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}  # 逐行註解：建立符合需求格式的新記憶物件。
+    item = build_memory_json_item(memory_id, cleaned_content)  # 逐行註解：建立符合 memories JSON 格式的新記憶物件。
     memories.append(item)  # 逐行註解：把新記憶加入這位使用者自己的清單。
     save_permanent_memories(interaction.user.id, memories)  # 逐行註解：用 UTF-8 寫回這位使用者自己的 JSON 檔。
-    reply = f"✅ 已儲存記憶\n\n編號：{memory_id}\n\n內容：\n{cleaned_content}"  # 逐行註解：組出使用者指定的回覆格式。
+    reply = f"✅ 已寫入 memories JSON：\n{format_memory_json_code_block([item])}"  # 逐行註解：顯示和寫入格式一致。
     await send_interaction_text_chunks(interaction, reply, ephemeral=True)  # 逐行註解：送出結果，超過 Discord 長度時自動分段。
 
 
@@ -2740,30 +3536,152 @@ async def list_memories_command(interaction: discord.Interaction):  # 逐行註�
     await send_interaction_embed_pages(interaction, embeds, ephemeral=True)  # 逐行註解：送出 Embed 分頁。
 
 
-@tree.command(name="recall", description="讀取永久記憶並產生 AI 總結")  # 逐行註解：註冊 /recall slash command，用來顯示記憶並請 Ollama 總結。
-async def recall_command(interaction: discord.Interaction):  # 逐行註解：定義 /recall 指令。
-    if not is_allowed_interaction_user(interaction):  # 逐行註解：讀取永久記憶前依目前情境檢查權限，統一走 ALLOWED_USERS 與 SUPER_USERS。
-        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：沒有權限時回覆私人提醒。
-        return  # 逐行註解：沒有權限就停止。
-    memories = load_permanent_memories(interaction.user.id)  # 逐行註解：只讀目前使用者自己的永久記憶。
-    if not memories:  # 逐行註解：沒有記憶時不需要呼叫 Ollama。
-        await send_interaction_embed_pages(interaction, build_memory_list_embeds(memories, title="📚 我的永久記憶"), ephemeral=True)  # 逐行註解：用 Embed 顯示空狀態。
-        return  # 逐行註解：停止指令。
-    await interaction.response.defer(ephemeral=True, thinking=True)  # 逐行註解：先 defer，避免 Ollama 總結等待時 slash command 逾時。
-    embeds = build_memory_list_embeds(memories, title="📚 我的永久記憶")  # 逐行註解：先建立和 /list 類似的記憶 Embed。
-    await send_interaction_embed_pages(interaction, embeds, ephemeral=True)  # 逐行註解：送出記憶 Embed 分頁。
-    memory_lines = [f"{item.get('id')}. {item.get('content')}" for item in memories]  # 逐行註解：整理給使用者與 AI 的編號記憶列表。
-    summary_prompt_lines = [  # 逐行註解：用清單建立 AI 總結 prompt。
-        "以下是這位 Discord 使用者的永久記憶。",  # 逐行註解：說明資料來源。
-        "請用繁體中文整理成 2 到 5 句自然摘要。",  # 逐行註解：要求摘要長度與語言。
-        "不要捏造沒有出現在記憶裡的內容。",  # 逐行註解：要求模型不要幻覺。
-        "",  # 逐行註解：加入空行。
-        "\n".join(memory_lines),  # 逐行註解：放入所有永久記憶。
-    ]  # 逐行註解：結束 prompt 清單。
-    model = selected_text_model_for_user(interaction.user.id)  # 逐行註解：取得目前可用文字模型。
-    ai_summary = await ask_ollama_text(model, "\n".join(summary_prompt_lines), timeout_s=None)  # 逐行註解：請目前 Ollama 文字模型產生永久記憶摘要。
-    recall_text = "你目前的永久記憶：\n\n" + "\n".join(memory_lines) + f"\n\nAI 總結：\n\n{ai_summary}"  # 逐行註解：組出 /recall 指定的文字格式。
-    await send_interaction_text_chunks(interaction, recall_text, ephemeral=True)  # 逐行註解：送出 recall 結果，超過長度自動分段。
+def format_summary_memory_prompt_message(memory_items: list[dict], source_count: int, *, state: str = "preview") -> str:
+    """把 summary memory 的 memories JSON 預覽/結果限制在 Discord 單則訊息內。"""
+    json_text = format_memory_json_items(memory_items)
+    if len(json_text) > 1350:
+        shown_json = json_text[:1350].rstrip() + "\n  ... 預覽已截斷，更新會寫入完整 JSON"
+        shown_summary = f"```json\n{shown_json}\n```"
+    else:
+        shown_summary = format_memory_json_code_block(memory_items)
+    if state == "updated":
+        header = "Summary memory 已寫入 memories JSON"
+        footer = "已用這份整理後 JSON 覆蓋你的永久記憶；raw chat history 已保留。"
+    elif state == "cancelled":
+        header = "Summary memory 未更新"
+        footer = "沒有寫入 memories JSON，目前永久記憶沒有變更。"
+    else:
+        header = "Summary memory 預覽（memories JSON 格式）"
+        footer = "要用這份 JSON 更新永久記憶嗎？按「更新」會覆蓋目前 memories JSON，並保留 raw chat history。"
+
+    return (
+        f"{header}\n"
+        f"固定模型：{SUMMARY_MEMORY_OLLAMA_MODEL}\n"
+        f"來源記錄：{source_count} 筆\n\n"
+        f"{shown_summary}\n\n"
+        f"{footer}"
+    )
+
+
+class SummaryMemoryUpdateView(discord.ui.View):
+    """讓使用者確認是否用 gemma4_thinking 產生的整理稿更新 summary memory。"""
+
+    def __init__(self, target_user_id: int, memory_items: list[dict], source_count: int):
+        super().__init__(timeout=300)
+        self.target_user_id = target_user_id
+        self.memory_items = memory_items
+        self.source_count = source_count
+
+    def disable_buttons(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def reject_wrong_user(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.target_user_id:
+            return False
+        await interaction.response.send_message("這不是你的 summary memory 更新選項。", ephemeral=True)
+        return True
+
+    @discord.ui.button(label="更新", style=discord.ButtonStyle.primary)
+    async def update_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self.reject_wrong_user(interaction):
+            return
+        save_permanent_memories(self.target_user_id, self.memory_items)
+        upsert_summary_memory(self.target_user_id, format_memory_json_items(self.memory_items))
+        self.disable_buttons()
+        await interaction.response.edit_message(
+            content=format_summary_memory_prompt_message(self.memory_items, self.source_count, state="updated"),
+            view=self,
+        )
+
+    @discord.ui.button(label="不更新", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self.reject_wrong_user(interaction):
+            return
+        self.disable_buttons()
+        await interaction.response.edit_message(
+            content=format_summary_memory_prompt_message(self.memory_items, self.source_count, state="cancelled"),
+            view=self,
+        )
+
+
+@tree.command(name="clear", description="清空你的聊天記錄")
+async def clear_memory(interaction: discord.Interaction):
+    """輸入 /clear，清空目前使用者的全部 bot 聊天記錄。"""
+    private_reply = interaction.guild is not None
+    if not is_allowed_interaction_user(interaction):
+        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=private_reply)
+        return
+    deleted_keys = clear_user_conversation_memory(interaction.user.id)
+    await interaction.response.send_message(
+        f"已清空聊天記錄（清掉 {deleted_keys} 個記錄區）。",
+        ephemeral=private_reply,
+    )
+
+
+@tree.command(name="summary_memory", description="用 gemma4_thinking 整理並更新 summary memory")
+async def summary_memory(interaction: discord.Interaction):
+    """輸入 /summary_memory，先整理聊天記錄，再詢問是否更新 summary memory。"""
+    private_reply = interaction.guild is not None
+    if not is_allowed_interaction_user(interaction):
+        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=private_reply)
+        return
+
+    memory_context = format_user_memory_for_summary(interaction.user.id)
+    source_count = count_user_memory_records(interaction.user.id)
+    if not memory_context:
+        await interaction.response.send_message("目前沒有聊天記錄可整理。", ephemeral=private_reply)
+        return
+
+    await interaction.response.defer(ephemeral=private_reply, thinking=True)
+    response_message = await interaction.followup.send(
+        thinking_animation_text(SUMMARY_MEMORY_OLLAMA_MODEL, THINKING_FRAMES[0]),
+        ephemeral=private_reply,
+        wait=True,
+    )
+    thinking_stop_event = asyncio.Event()
+    thinking_task = asyncio.create_task(run_thinking_animation(response_message, thinking_stop_event, SUMMARY_MEMORY_OLLAMA_MODEL))
+
+    try:
+        summary_reply = await ask_ollama_text(
+            SUMMARY_MEMORY_OLLAMA_MODEL,
+            build_summary_memory_prompt(memory_context),
+            timeout_s=None,
+            include_thinking=False,
+        )
+        summary_contents = parse_summary_memory_items(str(summary_reply))
+        if not summary_contents:
+            thinking_stop_event.set()
+            try:
+                await thinking_task
+            except Exception as stop_error:
+                print(f"/summary_memory Thinking 動畫停止失敗：{type(stop_error).__name__}: {stop_error}")
+            await safe_edit_message(response_message, "summary_memory 沒有產生可寫入 memories JSON 的內容。")
+            return
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        summary_items = [build_memory_json_item(index + 1, content, created_at) for index, content in enumerate(summary_contents)]
+    except Exception as e:
+        thinking_stop_event.set()
+        try:
+            await thinking_task
+        except Exception as stop_error:
+            print(f"/summary_memory Thinking 動畫停止失敗：{type(stop_error).__name__}: {stop_error}")
+        await safe_edit_message(response_message, f"（summary memory 整理失敗：{type(e).__name__}: {str(e)[:300]}）")
+        return
+
+    thinking_stop_event.set()
+    try:
+        await thinking_task
+    except Exception as e:
+        print(f"/summary_memory Thinking 動畫停止失敗：{type(e).__name__}: {e}")
+
+    view = SummaryMemoryUpdateView(interaction.user.id, summary_items, source_count)
+    preview_content = format_summary_memory_prompt_message(summary_items, source_count)
+    try:
+        await response_message.edit(content=preview_content, view=view)
+    except Exception as e:
+        print(f"/summary_memory 預覽按鈕建立失敗：{type(e).__name__}: {e}")
+        await safe_edit_message(response_message, preview_content)
 
 
 @tree.command(name="forget", description="刪除指定編號的永久記憶")  # 逐行註解：註冊 /forget slash command，用來刪除目前使用者自己的指定記憶。
@@ -3359,6 +4277,34 @@ async def on_message(message):  # 逐行註解：定義非同步函式 on_messag
     if message.guild is not None:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
         return  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
 
+    if user_text.lower() in {"clear", "/clear", "清空", "清除記憶"}:
+        deleted_keys = clear_user_conversation_memory(message.author.id)
+        await message.channel.send(f"已清空聊天記錄（清掉 {deleted_keys} 個記錄區）。")
+        return
+
+    identity_answer = build_identity_answer(message.author.id, user_text)
+    if identity_answer:
+        selected_model_for_memory = dm_user_model.get(message.author.id, DEFAULT_CHAT_MODEL)
+        remember_conversation(message.author.id, selected_model_for_memory, user_text, identity_answer)
+        await message.channel.send(identity_answer)
+        return
+
+    temporary_memory_content = extract_temporary_memory_candidate(user_text)
+    if temporary_memory_content:
+        stored_content = f"使用者暫時記住：{temporary_memory_content}"
+        remember_conversation(message.author.id, SHARED_MEMORY_MODEL, "短期/shared memory", stored_content)
+        preview_item = build_memory_json_item(1, stored_content)
+        await message.channel.send(f"已寫入短期/shared memory：\n{format_memory_json_code_block([preview_item])}")
+        return
+
+    if user_text_has_memory_request(user_text):
+        permanent_memory_content = extract_explicit_memory_candidate(user_text)
+        if permanent_memory_content:
+            async def _send_direct_memory_offer(content: str, view: discord.ui.View):
+                await message.channel.send(content, view=view)
+            await send_memory_confirmation_offer(message.author.id, permanent_memory_content, _send_direct_memory_offer)
+            return
+
     # 如果是 Discord 指令（例如 /hello），就不要當成一般聊天內容來回覆
     if user_text.startswith("/"):  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
         return  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
@@ -3717,8 +4663,8 @@ async def hello(interaction: discord.Interaction):  # 逐行註解：定義非�
 
 @tree.command(name="stop", description="停止目前正在思考的 AI 任務")  # 逐行註解：註冊 /stop 指令，讓使用者可以停止自己的 AI 思考。
 async def stop_ai(interaction: discord.Interaction):  # 逐行註解：定義 /stop 指令處理函式。
-    if not require_super_user(interaction.user):  # 逐行註解：/stop 被列為敏感指令，只允許 SUPER_USERS 使用。
-        await interaction.response.send_message(SENSITIVE_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：非超級使用者回覆指定敏感功能拒絕文字。
+    if not is_allowed_interaction_user(interaction):  # 逐行註解：/stop 讓所有 ALLOWED_USERS 與 SUPER_USERS 都能使用。
+        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：非授權使用者回覆無權限文字。
         return  # 逐行註解：沒有權限就停止指令。
     private_reply = interaction.guild is not None  # 逐行註解：伺服器中用私人回覆，DM 中用一般回覆。
     stopped = await stop_active_ai_run(interaction.user.id)  # 逐行註解：嘗試停止這位使用者目前登記中的 AI 任務。
@@ -3726,54 +4672,6 @@ async def stop_ai(interaction: discord.Interaction):  # 逐行註解：定義 /s
         await interaction.response.send_message(STOP_AI_MESSAGE, ephemeral=private_reply)  # 逐行註解：告知使用者 AI 思考已停止。
         return  # 逐行註解：成功回覆後結束指令。
     await interaction.response.send_message("目前沒有正在思考的 AI 任務。", ephemeral=private_reply)  # 逐行註解：沒有活躍任務時回覆目前無事可停。
-
-
-@tree.command(name="test_bar_chart", description="測試長條圖輸出")  # 逐行註解：註冊 /test_bar_chart，讓 Discord 頻道可直接測試圖表檔案。
-async def test_bar_chart(interaction: discord.Interaction):  # 逐行註解：定義長條圖測試指令。
-    if not is_allowed_interaction_user(interaction):  # 逐行註解：測試圖表指令依目前情境檢查權限，統一走 ALLOWED_USERS 與 SUPER_USERS。
-        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：沒有權限時只私下提醒使用者。
-        return  # 逐行註解：沒有權限就停止指令。
-    buffer = make_bar_chart("成績比較", ["小明", "小華", "小美"], [80, 92, 75])  # 逐行註解：用測試資料在記憶體產生長條圖。
-    await interaction.response.send_message(f"{SUCCESS} 長條圖測試", file=discord.File(buffer, filename="chart.png"))  # 逐行註解：直接把 BytesIO 圖表送到目前 Discord 頻道。
-
-
-@tree.command(name="test_line_chart", description="測試折線圖輸出")  # 逐行註解：註冊 /test_line_chart，讓 Discord 頻道可直接測試折線圖。
-async def test_line_chart(interaction: discord.Interaction):  # 逐行註解：定義折線圖測試指令。
-    if not is_allowed_interaction_user(interaction):  # 逐行註解：測試圖表指令依目前情境檢查權限，統一走 ALLOWED_USERS 與 SUPER_USERS。
-        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：沒有權限時只私下提醒使用者。
-        return  # 逐行註解：沒有權限就停止指令。
-    buffer = make_line_chart("一週閱讀時間", ["一", "二", "三", "四", "五"], [20, 35, 30, 45, 60])  # 逐行註解：用測試資料在記憶體產生折線圖。
-    await interaction.response.send_message(f"{SUCCESS} 折線圖測試", file=discord.File(buffer, filename="chart.png"))  # 逐行註解：直接把 BytesIO 圖表送到目前 Discord 頻道。
-
-
-@tree.command(name="test_pie_chart", description="測試圓餅圖輸出")  # 逐行註解：註冊 /test_pie_chart，讓 Discord 頻道可直接測試圓餅圖。
-async def test_pie_chart(interaction: discord.Interaction):  # 逐行註解：定義圓餅圖測試指令。
-    if not is_allowed_interaction_user(interaction):  # 逐行註解：測試圖表指令依目前情境檢查權限，統一走 ALLOWED_USERS 與 SUPER_USERS。
-        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：沒有權限時只私下提醒使用者。
-        return  # 逐行註解：沒有權限就停止指令。
-    buffer = make_pie_chart("任務比例", ["完成", "進行中", "未開始"], [55, 30, 15])  # 逐行註解：用測試資料在記憶體產生圓餅圖。
-    await interaction.response.send_message(f"{SUCCESS} 圓餅圖測試", file=discord.File(buffer, filename="chart.png"))  # 逐行註解：直接把 BytesIO 圖表送到目前 Discord 頻道。
-
-
-@tree.command(name="test_symbols", description="測試特殊符號輸出")  # 逐行註解：註冊 /test_symbols，讓 Discord 頻道可直接測試格式工具。
-async def test_symbols(interaction: discord.Interaction):  # 逐行註解：定義特殊符號測試指令。
-    if not is_allowed_interaction_user(interaction):  # 逐行註解：測試符號指令依目前情境檢查權限，統一走 ALLOWED_USERS 與 SUPER_USERS。
-        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：沒有權限時只私下提醒使用者。
-        return  # 逐行註解：沒有權限就停止指令。
-    await interaction.response.send_message(symbol_demo_text())  # 逐行註解：將 format_utils 的符號測試文字送到目前 Discord 頻道。
-
-
-@tree.command(name="dm", description="Send me a DM (for testing DM chat)")  # 逐行註解：這行是裝飾器，用來替下一個函式或類別加上 Discord/介面設定。
-async def dm(interaction: discord.Interaction, text: str):  # 逐行註解：定義非同步函式 dm，可以搭配 await 處理 Discord 或網路等待。
-    """輸入 /dm <文字>，機器人會私訊你同樣的文字（用來測試 DM 功能）"""  # 逐行註解：這行是文字內容，通常用來組 prompt、訊息或後台紀錄。
-    if not is_allowed_interaction_user(interaction):  # 逐行註解：測試 DM 指令依目前情境檢查權限，統一走 ALLOWED_USERS 與 SUPER_USERS。
-        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：沒有權限時回覆提醒。
-        return  # 逐行註解：沒有權限時停止，不發私訊。
-    try:  # 逐行註解：開始嘗試執行可能會失敗的程式碼，方便後面捕捉錯誤。
-        await interaction.user.send(text)  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
-        await interaction.response.send_message("已私訊你了", ephemeral=True)  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
-    except Exception as e:  # 逐行註解：捕捉 try 區塊發生的錯誤，避免 bot 直接崩潰。
-        await interaction.response.send_message(f"私訊失敗：{type(e).__name__}", ephemeral=True)  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
 
 
 @tree.command(name="model", description="(DM only) Select the model for DM chat")  # 逐行註解：這行是裝飾器，用來替下一個函式或類別加上 Discord/介面設定。
@@ -3827,6 +4725,28 @@ async def ask(interaction: discord.Interaction, question: str):  # 逐行註解�
     if not q:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
         await interaction.response.send_message("請輸入問題", ephemeral=True)  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
         return  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
+
+    identity_answer = build_identity_answer(interaction.user.id, q)
+    if identity_answer:
+        remember_conversation(interaction.user.id, DEFAULT_CHAT_MODEL, q, identity_answer)
+        await interaction.response.send_message(identity_answer, ephemeral=True)
+        return
+
+    temporary_memory_content = extract_temporary_memory_candidate(q)
+    if temporary_memory_content:
+        stored_content = f"使用者暫時記住：{temporary_memory_content}"
+        remember_conversation(interaction.user.id, SHARED_MEMORY_MODEL, "短期/shared memory", stored_content)
+        preview_item = build_memory_json_item(1, stored_content)
+        await interaction.response.send_message(f"已寫入短期/shared memory：\n{format_memory_json_code_block([preview_item])}", ephemeral=True)
+        return
+
+    if user_text_has_memory_request(q):
+        permanent_memory_content = extract_explicit_memory_candidate(q)
+        if permanent_memory_content:
+            async def _send_ask_memory_offer(content: str, view: discord.ui.View):
+                await interaction.response.send_message(content, view=view, ephemeral=True)
+            await send_memory_confirmation_offer(interaction.user.id, permanent_memory_content, _send_ask_memory_offer)
+            return
 
     await interaction.response.defer(ephemeral=True, thinking=True)  # 逐行註解：先 defer，避免 Ollama 等太久讓 Discord 指令逾時。
     response_message = await interaction.followup.send(  # 逐行註解：建立同一則之後要反覆 edit 的 slash followup 訊息。
@@ -4151,7 +5071,7 @@ def memory_unit_to_bytes(value: str, unit: str) -> float:  # 逐行註解：把 
     return float(value) * multiplier  # 逐行註解：回傳 bytes。
 
 
-def parse_top_physmem(line: str) -> dict:  # 逐行註解：解析 top 的 PhysMem 行，作為 /debugstate 比對用。
+def parse_top_physmem(line: str) -> dict:  # 逐行註解：解析 top 的 PhysMem 行，作為 RAM 資料來源比對用。
     match = re.search(r"PhysMem:\s*([0-9.]+)([KMGT]?) used.*?,\s*([0-9.]+)([KMGT]?) unused", line or "", re.IGNORECASE)  # 逐行註解：抓 used 和 unused。
     if not match:  # 逐行註解：如果格式不符合，就回空 dict。
         return {}  # 逐行註解：代表解析失敗。
@@ -4205,7 +5125,7 @@ def get_cpu_stats(mactop_sample: dict | None = None, macmon_sample: dict | None 
 
 
 def get_ram_stats(mactop_sample: dict | None = None, macmon_sample: dict | None = None, top_output: str = "") -> dict:  # 逐行註解：定義取得 RAM 使用量的函式。
-    """使用 psutil available 口徑計算 RAM，並保留 top PhysMem raw 給 /debugstate。"""  # 逐行註解：避免 mem.used 和 mem.percent 在 macOS 上看起來互相矛盾。
+    """使用 psutil available 口徑計算 RAM，並保留 top PhysMem raw 供內部比對。"""  # 逐行註解：避免 mem.used 和 mem.percent 在 macOS 上看起來互相矛盾。
     top_line = latest_line_starting_with(top_output, "PhysMem:")  # 逐行註解：讀取 top 第二筆 PhysMem 行。
     top_parsed = parse_top_physmem(top_line)  # 逐行註解：解析 top 記憶體 raw，供 debug 比對。
     try:  # 逐行註解：先嘗試匯入 psutil，符合 /state 原本 RAM 資料來源需求。
@@ -4571,48 +5491,10 @@ def build_computer_embed(stats: dict) -> discord.Embed:  # 逐行註解：定義
     )  # 逐行註解：建立 Discord Embed。
 
     embed.set_footer(
-        text="Use /debugstate for raw sensor data."
+        text="Raw sensor data is kept internal."
     )  # 逐行註解：底部說明。
 
     return embed  # 逐行註解：回傳 Embed。
-
-def build_debug_state_embed(stats: dict) -> discord.Embed:  # 逐行註解：建立 /debugstate 的資料來源檢查面板。
-    cpu = stats["cpu"]  # 逐行註解：取出 CPU 資料。
-    ram = stats["ram"]  # 逐行註解：取出 RAM 資料。
-    gpu = stats["gpu"]  # 逐行註解：取出 GPU 資料。
-    temp = stats["temperature"]  # 逐行註解：取出溫度資料。
-    fans = stats["fans"]  # 逐行註解：取出風扇資料。
-    raw = stats.get("raw") or {}  # 逐行註解：取出原始資料來源。
-    lines = [  # 逐行註解：建立 debug 內容。
-        "DEBUG STATE",  # 逐行註解：標題。
-        "",  # 逐行註解：空行。
-        f"top CPU raw: {cpu.get('top_raw') or 'N/A'}",  # 逐行註解：顯示 top CPU 原始行。
-        f"top parsed: {cpu.get('top_parsed') or {}}",  # 逐行註解：顯示 top 解析值。
-        f"psutil CPU total(avg cores): {format_percent(cpu.get('psutil_total'))}",  # 逐行註解：顯示 psutil per-core 平均。
-        f"per-core CPU: {cpu.get('psutil_cores') or cpu.get('cores') or []}",  # 逐行註解：顯示每核心資料。
-        "",  # 逐行註解：空行。
-        f"RAM source: {ram.get('source')}",  # 逐行註解：顯示 RAM 來源。
-        f"RAM final: {format_bytes_gb(ram.get('used'))} / {format_bytes_gb(ram.get('total'))} ({format_percent(ram.get('percent'))})",  # 逐行註解：顯示 RAM 最終值。
-        f"top PhysMem raw: {ram.get('top_raw') or 'N/A'}",  # 逐行註解：顯示 top PhysMem 原始行。
-        f"top PhysMem parsed: {ram.get('top_parsed') or {}}",  # 逐行註解：顯示 top PhysMem 解析值。
-        "",  # 逐行註解：空行。
-        f"GPU source: {gpu.get('source')}",  # 逐行註解：顯示 GPU 來源。
-        f"GPU final estimate: {format_percent(gpu.get('total'))}",  # 逐行註解：顯示 GPU estimate 最終值。
-        f"GPU attempts: {gpu.get('attempts')}",  # 逐行註解：顯示 GPU 嘗試來源。
-        "powermetrics GPU raw:",  # 逐行註解：標示 raw 輸出。
-        short_debug_text(raw.get("powermetrics_gpu_power") or gpu.get("powermetrics_raw") or raw.get("powermetrics_gpu_all") or "N/A", 900),  # 逐行註解：顯示 powermetrics GPU raw 或 sudo 失敗訊息。
-        "",  # 逐行註解：空行。
-        f"Temperature source: {temp.get('source')}",  # 逐行註解：顯示溫度來源。
-        f"Temperature final CPU/GPU: {format_temperature(temp.get('cpu_max'))} / {format_temperature(temp.get('gpu_max'))}",  # 逐行註解：顯示 CPU/GPU 溫度。
-        f"Fan source: {fans.get('source')}",  # 逐行註解：顯示風扇來源。
-        f"Fan final: {fans.get('fans') or 'N/A'}",  # 逐行註解：顯示風扇最終資料。
-        "powermetrics SMC raw:",  # 逐行註解：標示 SMC raw。
-        short_debug_text(raw.get("powermetrics_smc") or temp.get("powermetrics_raw") or fans.get("powermetrics_raw") or "N/A", 900),  # 逐行註解：顯示 powermetrics smc raw 或 sudo 失敗訊息。
-        "",  # 逐行註解：空行。
-        f"Final values: CPU={format_percent(cpu.get('total'))}, RAM={format_percent(ram.get('percent'))}, GPU estimate={format_percent(gpu.get('total'))}, TEMP={format_temperature(max_available_temperature(temp))}, FAN={first_fan_rpm_text(fans)}",  # 逐行註解：顯示主畫面最終值。
-    ]  # 逐行註解：結束 debug lines。
-    body = make_code_block("\n".join(lines)[:3900], "txt")  # 逐行註解：避免 Embed description 超過限制。
-    return discord.Embed(title="Debug State", description=body, color=0x8B949E)  # 逐行註解：回傳 debug embed。
 
 
 def collect_computer_stats() -> dict:  # 逐行註解：定義整合所有 Mac 狀態資料的函式。
@@ -4635,7 +5517,7 @@ def collect_computer_stats() -> dict:  # 逐行註解：定義整合所有 Mac �
         "fans": get_fan_stats(mactop_sample, smc_output),  # 逐行註解：取得風扇 RPM。
         "battery": get_battery_stats(),  # 逐行註解：取得電池狀態。
         "system_name": system_info.get("name") or system_info.get("chip_name") or "",  # 逐行註解：保存晶片名稱。
-        "raw": {  # 逐行註解：保存 /debugstate 要看的原始資料。
+        "raw": {  # 逐行註解：保存內部資料來源比對用的原始資料。
             "top_ok": ok_top,  # 逐行註解：top 是否成功。
             "top_error": top_error,  # 逐行註解：top 錯誤。
             "top_output": top_output,  # 逐行註解：top raw。
@@ -4722,46 +5604,6 @@ class StatePasswordModal(discord.ui.Modal, title="查看 Mac 狀態"):  # 逐行
         )  # 逐行註解：結束 print。
         await interaction.response.defer(ephemeral=True)  # 逐行註解：密碼正確後先 defer，避免 Mac 狀態查詢超過 Discord 時限。
         asyncio.create_task(send_state_monitor_after_password(interaction, show_apple_loading=self.show_apple_loading))  # 逐行註解：建立背景監控 task，讓 /state 每 3 秒持續刷新同一則訊息。
-
-
-class DebugStatePasswordModal(discord.ui.Modal, title="查看 State Debug"):  # 逐行註解：定義 /debugstate 專用密碼視窗，避免系統 raw data 對所有人公開。
-    password = discord.ui.TextInput(  # 逐行註解：建立密碼輸入欄位。
-        label="請輸入 debug state 密碼",  # 逐行註解：設定 Modal 欄位標題。
-        placeholder="請輸入 Mac 密碼",  # 逐行註解：提示使用同一套敏感指令密碼。
-        required=True,  # 逐行註解：密碼欄位必填。
-        max_length=200,  # 逐行註解：限制密碼長度。
-    )  # 逐行註解：結束 TextInput 設定。
-
-    async def on_submit(self, interaction: discord.Interaction):  # 逐行註解：定義使用者送出 Modal 後要執行的流程。
-        if not require_super_user(interaction.user):  # 逐行註解：再次檢查 SUPER_USERS，避免非超級使用者使用 /debugstate。
-            await interaction.response.send_message(sensitive_permission_message(), ephemeral=True)  # 逐行註解：沒有敏感指令權限就拒絕。
-            return  # 逐行註解：停止流程。
-        if not DISCORD_BOT_QUIT_PASSWORD:  # 逐行註解：如果 .env 沒設定敏感指令密碼，就拒絕查詢。
-            await interaction.response.send_message("尚未設定 DISCORD_BOT_QUIT_PASSWORD，無法使用 /debugstate。", ephemeral=True)  # 逐行註解：提醒設定密碼。
-            return  # 逐行註解：停止流程。
-        if self.password.value.strip() != DISCORD_BOT_QUIT_PASSWORD:  # 逐行註解：比對 Modal 密碼。
-            await interaction.response.send_message("密碼錯誤，無法查看 debug state。", ephemeral=True)  # 逐行註解：密碼錯誤時只回覆執行者。
-            return  # 逐行註解：停止流程。
-        author_name = (getattr(interaction.user, "global_name", None) or getattr(interaction.user, "display_name", None) or interaction.user.name or "").strip()  # 逐行註解：取得使用者顯示名稱。
-        author_account = str(interaction.user).strip()  # 逐行註解：取得 Discord 帳號字串。
-        print(  # 逐行註解：後台記錄誰使用了 debugstate，但不印密碼。
-            "\n".join(  # 逐行註解：組合多行後台紀錄。
-                [  # 逐行註解：開始 debugstate 後台紀錄。
-                    "——————————————————",  # 逐行註解：分隔線。
-                    f"使用者名稱：{author_name}",  # 逐行註解：顯示使用者名稱。
-                    f"使用者帳號：{author_account}",  # 逐行註解：顯示使用者帳號。
-                    f"使用者ID：{interaction.user.id}",  # 逐行註解：顯示 Discord ID。
-                    "使用者詢問：/debugstate",  # 逐行註解：顯示指令。
-                    "工具：debugstate",  # 逐行註解：顯示工具名稱。
-                    "狀態：密碼驗證通過，輸出 state raw/debug 資料",  # 逐行註解：顯示狀態。
-                    "——————————————————",  # 逐行註解：分隔線。
-                    "",  # 逐行註解：空行。
-                ]  # 逐行註解：結束後台紀錄。
-            )  # 逐行註解：結束 join。
-        )  # 逐行註解：結束 print。
-        await interaction.response.defer(ephemeral=True)  # 逐行註解：先 defer，避免資料收集超過 Discord 時限。
-        stats = await asyncio.to_thread(collect_computer_stats)  # 逐行註解：到 thread 裡執行 top/powermetrics/mactop 等可能阻塞的查詢。
-        await interaction.followup.send(embed=build_debug_state_embed(stats), ephemeral=True)  # 逐行註解：把 debug embed 只送給執行者。
 
 
 async def update_terminal_display(user_id: int):  # 逐行註解：定義非同步函式 update_terminal_display，每1.5秒更新一次終端顯示。
@@ -4935,15 +5777,6 @@ async def state(interaction: discord.Interaction):  # 逐行註解：定義 /sta
     await interaction.response.send_message("是否顯示 Apple 標誌？", view=StateAppleChoiceView(interaction.user.id), ephemeral=True)  # 逐行註解：先讓使用者選是或否，選完才跳密碼視窗。
 
 
-@tree.command(name="debugstate", description="查看 /state 的原始資料來源")  # 逐行註解：新增 /debugstate slash command，用來檢查 /state 數值來源。
-async def debugstate(interaction: discord.Interaction):  # 逐行註解：定義 /debugstate 指令。
-    """輸入 /debugstate，先輸入密碼，再顯示 top、powermetrics、psutil、mactop 的 raw/parsed 資料。"""  # 逐行註解：說明 debugstate 用途。
-    if not require_super_user(interaction.user):  # 逐行註解：先用 SUPER_USERS 檢查使用者，非超級使用者不能打開 /debugstate 密碼視窗。
-        await interaction.response.send_message(sensitive_permission_message(), ephemeral=True)  # 逐行註解：沒有敏感指令權限就回覆沒有權限。
-        return  # 逐行註解：停止指令。
-    await interaction.response.send_modal(DebugStatePasswordModal())  # 逐行註解：用 Modal 輸入密碼，避免密碼出現在聊天記錄。
-
-
 @tree.command(name="web_search", description="Search the web and answer with Ollama")  # 逐行註解：這行是裝飾器，用來替下一個函式或類別加上 Discord/介面設定。
 @discord.app_commands.choices(  # 逐行註解：這行是裝飾器，用來替下一個函式或類別加上 Discord/介面設定。
     model=[  # 逐行註解：開始建立一個跨多行的列表資料。
@@ -5024,7 +5857,19 @@ async def web_search(interaction: discord.Interaction, question: str, model: dis
             "4. 正在整理資料並產生回答…",  # 逐行註解：這行是文字內容，通常用來組 prompt、訊息或後台紀錄。
         )  # 逐行註解：結束上一個跨行函式呼叫或資料結構。
         memory_context = format_conversation_memory(interaction.user.id, selected_model)  # 逐行註解：設定 memory_context 這個變數，供後面的流程使用。
-        chart_rules = chart_output_rules_prompt()  # 逐行註解：取得 web_search 回答可用的圖表 JSON 規則。
+        
+        # 先收集是否有自動產生的圖表，用來調整 prompt。
+        all_auto_charts = []  # 逐行註解：建立暫存清單。
+        for page in page_reads:  # 逐行註解：遍歷所有已讀取的網頁結果。
+            if "auto_charts" in page and page["auto_charts"]:  # 逐行註解：若有自動偵測到的圖表。
+                all_auto_charts.extend(page["auto_charts"])  # 逐行註解：加入總清單。
+        
+        # 動態調整圖表規則 prompt。
+        if all_auto_charts:  # 逐行註解：若 Python 已成功從資料檔算出數據。
+            chart_prompt_rule = "9. 程式已成功從資料檔（CSV/Excel/JSON）擷取並精確計算出圖表數據，你只需在回答中針對數據內容進行文字分析與解說即可。"
+        else:  # 逐行註解：若 Python 無法從網頁中找到或讀取資料檔。
+            chart_prompt_rule = "9. 【重要】目前無法從網頁中取得結構化資料檔（如 CSV/Excel），請不要輸出任何 JSON、不要輸出 {\"type\":\"chart\"}、不要自行猜測或虛構圖表數據。請直接在回答中說明資料取得失敗的原因（如：下載失敗、找不到連結等）。"
+
         # gemma4_thinking 可以顯示 thinking；其他 gemma4 系列會要求不要輸出 thinking process。
         thinking_rule = (  # 逐行註解：開始一個跨多行的函式呼叫，下面幾行會放參數。
             "4. 這次選用 gemma4_thinking，允許輸出 thinking process，最後仍要給清楚的正式回答。"  # 逐行註解：這行是文字內容，通常用來組 prompt、訊息或後台紀錄。
@@ -5042,10 +5887,7 @@ async def web_search(interaction: discord.Interaction, question: str, model: dis
 6. 如果使用者問天氣、價格、新聞這類即時問題，要直接整理目前讀到的資訊，不要只叫使用者自己去點網址。
 7. 如果所有連結都讀取失敗或沒有可用文字，才可以說沒有成功讀到網頁，並簡短說明已嘗試哪些來源。
 8. 如果使用者問天氣但沒有提供地點，要明確說缺少地點；若搜尋結果仍有明確地點資料，可以先整理查到的內容並提醒地點可能不是使用者要的。
-9. 如果讀到的資料適合用圖表呈現，請只輸出圖表 JSON；來源連結會由程式另外補送，不要把來源塞進 JSON。
-
-圖表輸出規則：
-{chart_rules}
+{chart_prompt_rule}
 
 使用者問題：
 {q}
@@ -5088,13 +5930,29 @@ async def web_search(interaction: discord.Interaction, question: str, model: dis
         debug_ai_response(response)  # 逐行註解：印出 === AI RESPONSE === 與完整 AI 回覆。
         # 來源連結由程式端強制附加，不只依賴模型自己列來源，避免 Discord 回答沒有網址。
         source_links = format_web_search_source_links(page_reads, fetch_candidates)  # 逐行註解：設定 source_links 這個變數，供後面的流程使用。
-        chart_payload = parse_chart_reply(ollama_reply)  # 逐行註解：先檢查是否為圖表 JSON，避免附加來源後破壞 JSON 解析。
-        if not chart_payload:  # 逐行註解：如果模型沒有照規則輸出 JSON，就嘗試從 /web_search 問題保底產生圖表。
-            chart_payload = build_chart_payload_from_user_text(q)  # 逐行註解：支援使用者在搜尋問題內直接提供可視覺化資料。
-        if not chart_payload:  # 逐行註解：只有一般文字回答才把來源連結接到文字後面。
-            ollama_reply = append_source_links_to_reply(ollama_reply, source_links)  # 逐行註解：設定 ollama_reply 這個變數，供後面的流程使用。
-        assistant_memory_text = append_source_links_to_reply(chart_reply_summary(chart_payload), source_links) if chart_payload else ollama_reply  # 逐行註解：圖表回覆存記憶時保留完成訊息與來源，不存原始 JSON。
-        # 這裡故意存進共享記憶，不存進單一模型記憶，這樣使用者換模型後仍能問「剛剛查到什麼」。
+        
+        # 收集所有可能的圖表（嚴禁使用 Ollama 生成的 JSON，改為純 Python 計算）：
+        # 1. 來自讀取網頁資料集時，由 Python 自動精確計算產生的圖表。
+        chart_payloads = []  # 逐行註解：初始化圖表 payload 清單。
+        for page in page_reads:  # 逐行註解：遍歷所有讀取的網頁。
+            if "auto_charts" in page and page["auto_charts"]:  # 逐行註解：若該頁面有 Python 自動產生的精確圖表。
+                chart_payloads.extend(page["auto_charts"])  # 逐行註解：將自動產生的圖表加入發送清單。
+        
+        # 2. 若沒有自動圖表，才嘗試從使用者問題中直接解析標籤數值（例如：「蘋果10 橘子20」）。
+        if not chart_payloads:  # 逐行註解：若目前尚無任何自動產生的數據圖表。
+            fallback_payload = build_chart_payload_from_user_text(q)  # 逐行註解：嘗試從使用者原始問題中解析手打資料。
+            if fallback_payload:  # 逐行註解：若解析成功。
+                chart_payloads = [fallback_payload]  # 逐行註解：將該手動資料圖表存入清單。
+        
+        # 記憶體與結果處理：
+        if not chart_payloads:  # 逐行註解：最終若沒有任何圖表要顯示。
+            ollama_reply = append_source_links_to_reply(ollama_reply, source_links)  # 逐行註解：僅將來源連結加在 Ollama 的文字分析後。
+            assistant_memory_text = ollama_reply  # 逐行註解：存入記憶的內容為完整文字回答。
+        else:  # 逐行註解：若有成功的 Python 數據圖表。
+            summaries = [chart_reply_summary(p) for p in chart_payloads]  # 逐行註解：產生每張圖表的完成摘要文字。
+            assistant_memory_text = append_source_links_to_reply("\n".join(summaries), source_links)  # 逐行註解：記憶存入圖表摘要與來源。
+
+        # 這裡故意存進共享記憶，不存進單一模型記憶，讓使用者換模型後仍能問「剛剛查到什麼」。
         web_search_memory_reply = f"這是上一筆 /web_search 查到並回答過的內容，後續使用者說「剛剛查到的」或「統整一下」時要接續這筆資料。\n\n{assistant_memory_text}"  # 逐行註解：把 web_search 回答包成更明確的記憶文字，讓後續聊天模型知道這是剛剛查到的資料。
         remember_conversation(interaction.user.id, SHARED_MEMORY_MODEL, f"/web_search {q}", web_search_memory_reply)  # 逐行註解：把 web_search 結果存進共享記憶，讓之後換模型聊天也能讀到剛剛查到的內容。
         thinking_sec = time.monotonic() - started  # 逐行註解：設定 thinking_sec 這個變數，供後面的流程使用。
@@ -5145,8 +6003,8 @@ async def web_search(interaction: discord.Interaction, question: str, model: dis
     if not ollama_reply:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
         ollama_reply = "（我沒有產生任何回覆）"  # 逐行註解：設定 ollama_reply 這個變數，供後面的流程使用。
 
-    if chart_payload:  # 逐行註解：如果 /web_search 回傳圖表 JSON，就送實際圖表圖片，不送 JSON 文字。
-        await send_chart_payload_to_interaction_channel(interaction, chart_payload, status_message=progress_message, ephemeral=private_reply)  # 逐行註解：用 BytesIO 圖表傳到 slash 指令原頻道。
+    if chart_payloads:  # 逐行註解：如果 /web_search 回傳圖表資料，就送實際圖表圖片。
+        await send_multiple_charts_to_interaction(interaction, chart_payloads, status_message=progress_message, ephemeral=private_reply)  # 逐行註解：一次發送所有產生的圖表圖片。
         if source_links:  # 逐行註解：圖表之外仍保留程式端整理出的來源連結。
             await send_text_to_interaction_channel(interaction, source_links, ephemeral=private_reply)  # 逐行註解：把來源連結送到同一個原頻道或 followup 備援。
         return  # 逐行註解：圖表已送出後結束，不再把 JSON 當文字顯示。
@@ -5406,13 +6264,15 @@ async def send_weather_hourly_part(interaction: discord.Interaction, weather_dat
     await send_weather_table_part(interaction, "當天每小時天氣表格", headers, rows, "weather_hourly_table.png")  # 傳送 PNG 表格。
 
 
-async def send_integrated_weather_report(interaction: discord.Interaction, city_name: str) -> None:  # 依序傳送完整天氣報告。
+async def send_integrated_weather_report(interaction: discord.Interaction, city_name: str) -> str:  # 依序傳送完整天氣報告。
     weather_data = await load_weather_report_data(city_name)  # 先取得 current 與 forecast 真實 API 資料。
+    memory_summary = f"{weather_report_city_label(weather_data, city_name)} 完整天氣報告：{get_current_weather_summary(weather_data)}"
     await send_weather_summary_part(interaction, weather_data, city_name)  # 1. 傳送當天天氣摘要。
     await send_week_table_part(interaction, weather_data)  # 2. 傳送整週天氣表格。
     await send_weather_temperature_chart_part(interaction, weather_data, city_name)  # 3. 傳送實際溫度與體感溫度折線圖。
     await send_humidity_chart_part(interaction, weather_data, city_name)  # 4. 傳送濕度折線圖。
     await send_weather_period_part(interaction, weather_data)  # 5. 傳送幾點到幾點的分時段表格。
+    return memory_summary
 
 
 def weather_rows_to_prompt_table(headers: list[str], rows: list[list[str]], max_rows: int | None = None) -> str:  # 將天氣表格資料轉成給 AI 讀的精簡文字表格。
@@ -5709,8 +6569,9 @@ async def send_weather_ai_action(interaction: discord.Interaction, weather_data:
     return False  # 不支援的 action 交給呼叫端處理。
 
 
-async def answer_weather_question(interaction: discord.Interaction, city_name: str, question: str) -> None:  # /weather 有填問題時，用天氣資料交給 AI 回答。
+async def answer_weather_question(interaction: discord.Interaction, city_name: str, question: str) -> str:  # /weather 有填問題時，用天氣資料交給 AI 回答，並回傳可寫入聊天記憶的摘要。
     weather_data = await load_weather_report_data(city_name)  # 先查 OpenWeather 真實資料。
+    city_label = weather_report_city_label(weather_data, city_name)  # 取得城市標籤，讓聊天記憶保存清楚地點。
     wants_visual = weather_question_wants_visual(question)  # 先判斷這次問題是否明確要求圖表、表格或完整報告。
     sent_visuals = await send_weather_question_requested_visuals(interaction, weather_data, city_name, question)  # 先由程式直接傳送可確定的相關 PNG 圖表或表格。
     prompt = build_weather_question_prompt(city_name, question, weather_data, sent_visuals=sent_visuals)  # 建立含表格、時段、警報和輸出規則的 prompt。
@@ -5723,18 +6584,24 @@ async def answer_weather_question(interaction: discord.Interaction, city_name: s
     action_data = parse_weather_ai_action(reply)  # 先檢查 AI 是否要求傳送天氣專用視覺化。
     if action_data and wants_visual and not sent_visuals:  # 只有尚未由程式傳送視覺化時才執行 weather_action。
         if await send_weather_ai_action(interaction, weather_data, city_name, action_data):  # 執行圖表或表格動作。
-            return  # 動作已送出就結束。
-        await send_interaction_text_chunks(interaction, f"{ERROR} 不支援的天氣動作：{str(action_data.get('action') or '')[:80]}", ephemeral=False)  # 不支援時顯示安全錯誤。
-        return  # 避免把 JSON 原文送出。
+            action_label = str(action_data.get("action") or "weather_action").strip()  # 保存已執行動作名稱，讓後續 summary memory 看得懂。
+            action_message = force_common_traditional_chinese(str(action_data.get("message") or "").strip())  # 保存 AI 提供的簡短說明。
+            if action_message:  # 如果 action 有附說明，就把說明寫入記憶。
+                return f"{city_label} 天氣問題「{question.strip()}」：{action_message}"  # 回傳給聊天記憶。
+            return f"{city_label} 天氣問題「{question.strip()}」已傳送 {action_label} 視覺化。"  # 動作已送出就回傳記憶摘要。
+        unsupported_reply = f"{ERROR} 不支援的天氣動作：{str(action_data.get('action') or '')[:80]}"  # 不支援時顯示安全錯誤。
+        await send_interaction_text_chunks(interaction, unsupported_reply, ephemeral=False)  # 傳送安全錯誤。
+        return unsupported_reply  # 避免把 JSON 原文送出，也讓記憶知道這次失敗。
     if action_data and (not wants_visual or sent_visuals):  # 一般問題或已傳圖表時不應該執行模型誤吐的 weather_action。
         fallback_reply = build_weather_question_fallback_answer(city_name, question, weather_data)  # 用真實資料產生文字備援。
         await send_interaction_text_chunks(interaction, fallback_reply, ephemeral=False)  # 傳送文字答案，不顯示 JSON。
-        return  # 結束一般問答流程。
+        return fallback_reply  # 結束一般問答流程，並回傳給聊天記憶。
     if looks_like_weather_action_json(reply):  # 如果像 weather_action 但解析失敗。
         fallback_reply = build_weather_question_fallback_answer(city_name, question, weather_data)  # 不再叫使用者換句話，直接用資料回答。
         await send_interaction_text_chunks(interaction, fallback_reply, ephemeral=False)  # 傳送安全文字備援。
-        return  # 避免把 JSON 原文送出。
+        return fallback_reply  # 避免把 JSON 原文送出，並回傳給聊天記憶。
     await send_interaction_text_chunks(interaction, reply, ephemeral=False)  # 一般回答或既有 chart JSON 交給共用傳送流程。
+    return reply  # 回傳實際送出的文字，讓 /summary_memory 可讀到這次 weather 結果。
 
 
 def sanitized_requests_error_summary(exc: requests.RequestException) -> str:  # 建立不含 URL 和 API key 的 requests 錯誤摘要。
@@ -5776,9 +6643,11 @@ async def weather(interaction: discord.Interaction, city_name: str, question: st
     try:  # 天氣查詢和傳送流程可能失敗。
         weather_question = (question or "").strip()  # 整理可選問題，空白代表走原本完整報告。
         if weather_question:  # 如果使用者有填問題，就改走 AI 天氣問答。
-            await answer_weather_question(interaction, city_name, weather_question)  # 用真實天氣資料交給 AI 回答或產生視覺化。
+            weather_memory_text = await answer_weather_question(interaction, city_name, weather_question)  # 用真實天氣資料交給 AI 回答或產生視覺化。
+            remember_conversation(interaction.user.id, SHARED_MEMORY_MODEL, f"/weather {city_name} {weather_question}", weather_memory_text)  # 把天氣問答寫進共享記憶，後面可直接要求總結。
             return  # 問答模式完成後不再送原本固定格式。
-        await send_integrated_weather_report(interaction, city_name)  # 沒填問題時維持原本完整天氣報告。
+        weather_memory_text = await send_integrated_weather_report(interaction, city_name)  # 沒填問題時維持原本完整天氣報告。
+        remember_conversation(interaction.user.id, SHARED_MEMORY_MODEL, f"/weather {city_name}", weather_memory_text)  # 把完整天氣報告摘要寫進共享記憶，讓 summary memory 可整理。
     except Exception as exc:  # 捕捉所有錯誤，避免 bot 崩潰。
         await handle_weather_command_error(interaction, exc)  # 用安全訊息回覆錯誤。
 
@@ -5958,7 +6827,8 @@ if __name__=="__main__":  # 逐行註解：判斷這個條件是否成立，成�
    ALLOWED_USERS 是一般允許使用者，可以聊天與使用一般指令。
    SUPER_USERS 會自動被視為 ALLOWED_USERS，所以不用重複寫兩次。
    不在 SUPER_USERS 或 ALLOWED_USERS 裡的人會收到「你沒有權限使用這個 Bot。」。
-   agent、state、run、quit、restart、shell、stop、shutdown、reload、eval、exec、debug、admin 這些敏感功能只看 SUPER_USERS。
+   agent、state、run、quit、restart、shell、shutdown、reload、eval、exec、debug、admin 這些敏感功能只看 SUPER_USERS。
+   （註：stop 功能已開放給所有授權使用者使用）
 
 2. 上線和下線通知流程
    send_startup_dm 會解析 ALLOWED_USERS 加 SUPER_USERS，然後私訊「Bot 已上線。」。
