@@ -962,6 +962,44 @@ def requested_chart_type_from_text(user_text: str) -> str:  # 逐行註解：從
     return ""  # 逐行註解：沒有明確圖表需求時回傳空字串。
 
 
+def clean_stable_chart_label(raw_label: str) -> str:  # 逐行註解：清理穩定圖表 parser 抓到的標籤，避免把指令詞當成資料名稱。
+    label = str(raw_label or "").strip(" \t\r\n-:：,，、;；")  # 逐行註解：先把標籤轉成字串並移除常見分隔符。
+    label = re.split(r"[，,、;；]", label)[-1].strip(" \t\r\n-:：,，、;；")  # 逐行註解：若標籤前面混到指令文字，就保留最後一段候選標籤。
+    prefix_patterns = (  # 逐行註解：建立可重複移除的指令前綴規則。
+        r"^(?:請你|請|麻煩你|麻煩|幫我|幫忙|幫|替我)\s*",  # 逐行註解：移除禮貌或請求開頭。
+        r"^(?:畫出|畫一個|畫個|畫|做出|做一個|做個|做|產生|建立|生成|給我|用)\s*",  # 逐行註解：移除畫圖或產生圖表的動作詞。
+        r"^(?:一個|一張|張|個)\s*",  # 逐行註解：移除中文數量詞。
+        r"^(?:圓餅圖|圆饼图|餅圖|饼图|長條圖|柱狀圖|折線圖|折线图|bar chart|pie chart|line chart|bar|pie|line|chart|graph|plot)\s*",  # 逐行註解：移除圖表類型詞。
+    )  # 逐行註解：結束前綴規則清單。
+    previous_label = None  # 逐行註解：保存上一輪清理結果，用來判斷是否還有前綴可移除。
+    while previous_label != label:  # 逐行註解：持續清理直到標籤不再改變。
+        previous_label = label  # 逐行註解：記錄本輪清理前的標籤。
+        for pattern in prefix_patterns:  # 逐行註解：逐一套用所有前綴清理規則。
+            label = re.sub(pattern, "", label, flags=re.IGNORECASE).strip(" \t\r\n-:：,，、;；")  # 逐行註解：移除符合的前綴並重新清掉分隔符。
+    label = re.sub(r"^(?:的|之)\s*", "", label).strip(" \t\r\n-:：,，、;；")  # 逐行註解：移除中文連接詞，處理「的圓餅圖」殘留情況。
+    return label  # 逐行註解：回傳可用於圖表顯示的乾淨標籤。
+
+
+def stable_parse_chart_data_from_user_text(user_text: str) -> tuple[list[str], list[float]]:  # 逐行註解：直接從使用者原始訊息穩定解析圖表 labels 與 values。
+    labels: list[str] = []  # 逐行註解：建立解析出的標籤清單。
+    values: list[float] = []  # 逐行註解：建立解析出的數值清單。
+    text = str(user_text or "").strip()  # 逐行註解：把原始訊息轉成字串並清理頭尾空白。
+    if not text:  # 逐行註解：空訊息沒有任何圖表資料可解析。
+        return labels, values  # 逐行註解：回傳空清單，讓呼叫端改走其他流程。
+    pair_pattern = re.compile(r"([^0-9+\-:：,，、;；\n]+?)\s*[:：]?\s*([-+]?\d+(?:\.\d+)?)%?")  # 逐行註解：支援「香蕉20」「香蕉 20」「香蕉：20」「香蕉:20」等格式。
+    for match in pair_pattern.finditer(text):  # 逐行註解：逐一找出訊息中所有標籤與數字配對。
+        label = clean_stable_chart_label(match.group(1))  # 逐行註解：清理配對中的標籤文字。
+        if not label:  # 逐行註解：空標籤不能拿來畫圖。
+            continue  # 逐行註解：略過無效配對，繼續看下一組。
+        try:  # 逐行註解：數值轉換可能失敗，所以用 try 保護。
+            value = float(match.group(2))  # 逐行註解：把抓到的數字文字轉成 float。
+        except (TypeError, ValueError):  # 逐行註解：若不是有效數字，就不要讓整個 parser 崩潰。
+            continue  # 逐行註解：略過這組壞資料。
+        labels.append(label)  # 逐行註解：保存有效標籤。
+        values.append(value)  # 逐行註解：保存有效數值。
+    return labels, values  # 逐行註解：回傳所有解析出的圖表資料。
+
+
 def extract_label_value_pairs_from_user_text(user_text: str) -> tuple[list[str], list[float]]:  # 逐行註解：從使用者訊息中抽取「標籤+數字」資料列。
     labels: list[str] = []  # 逐行註解：建立標籤清單。
     values: list[float] = []  # 逐行註解：建立數值清單。
@@ -1015,12 +1053,11 @@ def build_chart_payload_from_user_text(user_text: str) -> dict | None:  # 逐行
     chart_type = requested_chart_type_from_text(user_text)  # 逐行註解：先確認使用者是否明確要求支援的圖表類型。
     if chart_type not in CHART_TYPE_NAMES:  # 逐行註解：沒有圖表需求就不啟動保底流程。
         return None  # 逐行註解：回傳 None 讓一般聊天維持原流程。
-    # 逐行註解：優先嘗試新的 parse_chart_text parser，支援多種格式。
-    labels, values = parse_chart_text(user_text)
-    # 逐行註解：如果新 parser 失敗或沒有抓到資料，改用舊的 extract_label_value_pairs_from_user_text。
-    if not labels or len(labels) != len(values):
-        # 逐行註解：新 parser 未能解析，改用舊的 parser。
-        labels, values = extract_label_value_pairs_from_user_text(user_text)
+    labels, values = stable_parse_chart_data_from_user_text(user_text)  # 逐行註解：優先用穩定 parser 直接從使用者原文解析資料。
+    if not labels or len(labels) != len(values):  # 逐行註解：穩定 parser 沒抓到完整資料時才改用既有 parser。
+        labels, values = parse_chart_text(user_text)  # 逐行註解：使用原本獨立 parser 作為第二層備援。
+    if not labels or len(labels) != len(values):  # 逐行註解：第二層 parser 仍失敗時改用舊的逐行 parser。
+        labels, values = extract_label_value_pairs_from_user_text(user_text)  # 逐行註解：保留舊流程相容既有輸入格式。
     # 逐行註解：資料不足時不能畫圖。
     if not labels or len(labels) != len(values):  # 逐行註解：資料不足時不能畫圖。
         return None  # 逐行註解：回傳 None 讓一般回覆維持原流程。
@@ -1037,9 +1074,16 @@ def build_chart_payload_from_user_text(user_text: str) -> dict | None:  # 逐行
     return chart_data  # 逐行註解：回傳可直接送進 chart_utils 的圖表資料。
 
 
+def strip_markdown_json_code_block(raw_text: str) -> str:  # 逐行註解：清掉模型可能包住 JSON 的 markdown code block。
+    cleaned = ANSI_ESCAPE_RE.sub("", str(raw_text or "").strip())  # 逐行註解：先移除 ANSI 控制碼並整理頭尾空白。
+    fence_match = re.fullmatch(r"(?is)```(?:json)?\s*(.*?)\s*```", cleaned)  # 逐行註解：偵測整段內容是否被 ```json 或 ``` 包住。
+    if fence_match:  # 逐行註解：如果整段文字是 markdown code block。
+        return fence_match.group(1).strip()  # 逐行註解：只回傳 code block 裡面的 JSON 內容。
+    return cleaned  # 逐行註解：沒有 code block 時回傳清理後原文。
+
+
 def extract_first_json_object_text(raw_text: str) -> str:  # 逐行註解：從模型回覆中抓出第一個 JSON 物件文字。
-    cleaned = ANSI_ESCAPE_RE.sub("", (raw_text or "").strip())  # 逐行註解：先整理模型回覆頭尾空白，並移除終端可能混入的 ANSI 控制碼。
-    cleaned = re.sub(r"(?is)^```(?:json)?\s*|\s*```$", "", cleaned).strip()  # 逐行註解：移除模型可能包上的 JSON code block。
+    cleaned = strip_markdown_json_code_block(raw_text)  # 逐行註解：先清掉 markdown JSON code block，再進行 JSON 掃描。
     decoder = json.JSONDecoder()  # 逐行註解：建立 JSON decoder，用 raw_decode 從任意位置解析。
     for index, char in enumerate(cleaned):  # 逐行註解：逐字尋找可能的 JSON 物件起點。
         if char != "{":  # 逐行註解：只有左大括號才可能是 JSON 物件開頭。
@@ -1053,7 +1097,13 @@ def extract_first_json_object_text(raw_text: str) -> str:  # 逐行註解：從�
     return ""  # 逐行註解：找不到 JSON 物件時回傳空字串。
 
 
-def parse_chart_reply(raw_text: str) -> dict | None:  # 逐行註解：判斷模型回覆是否為圖表 JSON，成功時回傳整理後資料。
+def fallback_chart_payload_from_raw_user_text(fallback_user_text: str) -> dict | None:  # 逐行註解：在模型 JSON 解析失敗時，用使用者原始訊息建立圖表資料。
+    if not str(fallback_user_text or "").strip():  # 逐行註解：沒有原始使用者訊息時不能 fallback。
+        return None  # 逐行註解：回傳 None 讓呼叫端維持原本失敗處理。
+    return build_chart_payload_from_user_text(fallback_user_text)  # 逐行註解：呼叫穩定原文 parser 建立 chart payload。
+
+
+def parse_chart_reply(raw_text: str, fallback_user_text: str = "") -> dict | None:  # 逐行註解：判斷模型回覆是否為圖表 JSON，失敗時可用使用者原文 fallback。
     response = str(raw_text or "")  # 逐行註解：保留 AI 回覆原文，除錯與解析都用同一份內容。
     should_debug_response = looks_like_chart_json_response(response)  # 逐行註解：只有看起來像圖表 JSON 時才印完整原文，避免一般聊天洗版。
     if should_debug_response:  # 逐行註解：如果像圖表 JSON，就依需求印出 AI 原始回覆。
@@ -1063,11 +1113,17 @@ def parse_chart_reply(raw_text: str) -> dict | None:  # 逐行註解：判斷模
         if not json_text:  # 逐行註解：沒有 JSON 就代表是一般文字回答或模型格式錯誤。
             if should_debug_response:  # 逐行註解：看起來像圖表 JSON 卻抓不到物件時要印 traceback。
                 print_chart_traceback("找不到可解析的 JSON object")  # 逐行註解：完整記錄解析失敗原因。
+            fallback_payload = fallback_chart_payload_from_raw_user_text(fallback_user_text)  # 逐行註解：嘗試從使用者原始訊息補出圖表資料。
+            if fallback_payload:  # 逐行註解：如果原始訊息能解析成功。
+                return fallback_payload  # 逐行註解：直接回傳 fallback 圖表資料。
             return None  # 逐行註解：回傳 None，讓呼叫端決定是否攔截原文。
         data = json.loads(json_text)  # 逐行註解：把 JSON 文字轉成 Python dict。
     except Exception as e:  # 逐行註解：任何解析例外都完整印出 traceback，不只 JSONDecodeError。
         print(f"圖表 JSON 解析失敗：{type(e).__name__}: {e}")  # 逐行註解：先印出錯誤類型與摘要。
         traceback.print_exc()  # 逐行註解：依需求完整印出 traceback。
+        fallback_payload = fallback_chart_payload_from_raw_user_text(fallback_user_text)  # 逐行註解：json.loads 失敗時改用正則解析使用者原始訊息。
+        if fallback_payload:  # 逐行註解：如果 fallback 成功建立圖表資料。
+            return fallback_payload  # 逐行註解：回傳 fallback 圖表資料，不讓壞 JSON 影響使用者。
         return None  # 逐行註解：解析失敗時改走一般文字流程。
     if not isinstance(data, dict):  # 逐行註解：圖表資料必須是 JSON object。
         return None  # 逐行註解：格式不符時改走一般文字流程。
@@ -2029,6 +2085,7 @@ async def search_web_results(question: str, *, limit: int = 5) -> list[dict[str,
 async def fetch_web_pages(  # 逐行註解：定義非同步函式 fetch_web_pages，可以搭配 await 處理 Discord 或網路等待。
     results: list[dict[str, str]],  # 逐行註解：這行是跨行資料或參數的一個項目。
     *,  # 逐行註解：這行是跨行資料或參數的一個項目。
+    question: str = "",  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
     limit: int = 5,  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
     min_attempts: int = 3,  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
     min_successful: int = 1,  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
@@ -2060,7 +2117,7 @@ async def fetch_web_pages(  # 逐行註解：定義非同步函式 fetch_web_pag
                     df = dataset_utils.read_table_safely(data_bytes, f_type)  # 逐行註解：從記憶體讀取表格。
                     if df is not None and not df.empty:  # 逐行註解：如果成功讀取且有資料。
                         print(f"DEBUG: 成功讀取表格，形狀：{df.shape}，欄位：{df.columns.tolist()}")  # 逐行註解：輸出日誌。
-                        info = dataset_utils.infer_columns(df, q)  # 逐行註解：動態推論欄位意義。
+                        info = dataset_utils.infer_columns(df, question)  # 逐行註解：動態推論欄位意義。
                         
                         # 核心邏輯：自動偵測是否可產生特定圖表。
                         auto_payloads = []  # 逐行註解：準備存放自動產生的圖表。
@@ -4539,7 +4596,7 @@ async def on_message(message):  # 逐行註解：定義非同步函式 on_messag
                 attachment_info = ""  # 逐行註解：設定 attachment_info 這個變數，供後面的流程使用。
             response = ollama_reply  # 逐行註解：依除錯需求保留這次 AI 回覆原文變數。
             debug_ai_response(response)  # 逐行註解：印出 === AI RESPONSE === 與完整 AI 回覆。
-            chart_payload = parse_chart_reply(ollama_reply)  # 逐行註解：檢查 AI 回覆是否為圖表 JSON，避免直接把 JSON 送到 Discord。
+            chart_payload = parse_chart_reply(ollama_reply, user_text)  # 逐行註解：檢查 AI 回覆圖表 JSON，失敗時用使用者原文解析。
             if not chart_payload:  # 逐行註解：如果模型沒有照規則輸出 JSON，就嘗試從使用者原文保底產生圖表。
                 chart_payload = build_chart_payload_from_user_text(user_text)  # 逐行註解：支援「小明80」這類標籤數字黏在一起的資料。
             assistant_memory_text = chart_reply_summary(chart_payload) if chart_payload else ollama_reply  # 逐行註解：圖表回覆存記憶時改存完成訊息，不存原始 JSON。
@@ -4776,7 +4833,7 @@ async def ask(interaction: discord.Interaction, question: str):  # 逐行註解�
         ollama_reply = ollama_reply.strip()  # 逐行註解：設定 ollama_reply 這個變數，供後面的流程使用。
         response = ollama_reply  # 逐行註解：依除錯需求保留這次 AI 回覆原文變數。
         debug_ai_response(response)  # 逐行註解：印出 === AI RESPONSE === 與完整 AI 回覆。
-        chart_payload = parse_chart_reply(ollama_reply)  # 逐行註解：檢查 /ask 回覆是否為圖表 JSON，避免直接把 JSON 顯示給使用者。
+        chart_payload = parse_chart_reply(ollama_reply, q)  # 逐行註解：檢查 /ask 圖表 JSON，失敗時用 slash 問題原文解析。
         if not chart_payload:  # 逐行註解：如果模型沒有照規則輸出 JSON，就嘗試從 slash 指令問題保底產生圖表。
             chart_payload = build_chart_payload_from_user_text(q)  # 逐行註解：支援「星期一10」這類標籤數字黏在一起的資料。
         assistant_memory_text = chart_reply_summary(chart_payload) if chart_payload else ollama_reply  # 逐行註解：圖表回覆存記憶時改存完成訊息。
@@ -5844,7 +5901,7 @@ async def web_search(interaction: discord.Interaction, question: str, model: dis
             "3. 正在打開連結讀取網頁內容…",  # 逐行註解：這行是文字內容，通常用來組 prompt、訊息或後台紀錄。
         )  # 逐行註解：結束上一個跨行函式呼叫或資料結構。
         # 第三階段：真的打開網頁讀文字；如果前幾個失敗，會繼續試到至少一個成功。
-        page_reads = await fetch_web_pages(fetch_candidates, limit=5, min_attempts=3, min_successful=1)  # 逐行註解：設定 page_reads 這個變數，供後面的流程使用。
+        page_reads = await fetch_web_pages(fetch_candidates, question=q, limit=5, min_attempts=3, min_successful=1)  # 逐行註解：設定 page_reads 這個變數，供後面的流程使用。
         page_read_context = format_page_reads_for_log(page_reads)  # 逐行註解：設定 page_read_context 這個變數，供後面的流程使用。
         page_read_success = has_successful_page_read(page_reads)  # 逐行註解：設定 page_read_success 這個變數，供後面的流程使用。
         read_success_count = sum(1 for page in page_reads if (page.get("text") or "").strip())  # 逐行註解：設定 read_success_count 這個變數，供後面的流程使用。
