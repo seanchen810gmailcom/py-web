@@ -31,7 +31,6 @@ import tempfile  # 匯入 tempfile：暫存使用者上傳的舊 Office 檔，�
 import traceback  # 匯入 traceback：圖表 JSON 或繪圖流程失敗時印出完整錯誤堆疊。
 import requests  # 匯入 requests：用來查詢天氣 API 和其他 HTTP 請求。
 from myfunction.myfunction import WwatherAPI  # 匯入 WwatherAPI：天氣查詢工具類別。
-
 from chart_utils import make_bar_chart, make_line_chart, make_pie_chart, make_temperature_line_chart, make_humidity_line_chart, make_table_image  # 匯入圖表工具：用 matplotlib 在記憶體產生 PNG BytesIO。
 from format_utils import SUCCESS, ERROR, symbol_demo_text, WEATHER_TEMP, WEATHER_HUMIDITY, WEATHER_WIND, WEATHER_UMBRELLA, WEATHER_CLOUD, make_markdown_table, split_long_message, make_weather_embed as make_weather_summary_embed, weather_symbol_for_text  # 匯入格式工具：提供狀態符號、天氣符號、表格分段與天氣 Embed。
 from weather_utils import get_current_weather_summary, get_weekly_weather_table, get_today_hourly_table, get_today_rain_table, group_today_weather_periods, extract_today_temperature_series, extract_today_humidity_series, get_weather_alert_messages  # 匯入天氣資料整理工具：把 OpenWeather current/forecast 轉成摘要、表格、圖表序列和主動警報。
@@ -99,9 +98,9 @@ WEATHER_ALERT_DM_USER_IDS = unique_env_items(split_env_list(WEATHER_ALERT_DM_USE
 WEATHER_ALERT_CITY = os.getenv("WEATHER_ALERT_CITY", "Taipei").strip() or "Taipei"  # 逐行註解：設定要監控的城市，預設台北。
 WEATHER_ALERT_CHECK_SECONDS = max(60, int(os.getenv("WEATHER_ALERT_CHECK_SECONDS", "300")))  # 逐行註解：設定天氣警報檢查間隔，預設 5 分鐘且最低 60 秒。
 DISCORD_BOT_QUIT_PASSWORD = os.getenv("DISCORD_BOT_QUIT_PASSWORD", "").strip()  # 逐行註解：設定 DISCORD_BOT_QUIT_PASSWORD 這個變數，供後面的流程使用。
-NO_PERMISSION_MESSAGE = "You're not allowed to use this bot."  # 逐行註解：統一設定未在 ALLOWED_USERS 或 SUPER_USERS 時的拒絕文字。
-SENSITIVE_PERMISSION_MESSAGE = "Not super user"  # 逐行註解：統一設定非 SUPER_USERS 使用敏感功能時的拒絕文字。
-STOP_AI_MESSAGE = "⏹️ Stop Thinking"  # 逐行註解：統一設定 /stop 成功停止 AI 任務時要顯示的文字。
+NO_PERMISSION_MESSAGE = "你沒有權限使用這個 Bot。"  # 逐行註解：統一設定未在 ALLOWED_USERS 或 SUPER_USERS 時的拒絕文字。
+SENSITIVE_PERMISSION_MESSAGE = "你沒有權限使用此功能。"  # 逐行註解：統一設定非 SUPER_USERS 使用敏感功能時的拒絕文字。
+STOP_AI_MESSAGE = "⏹️ 已停止 AI 思考。"  # 逐行註解：統一設定 /stop 成功停止 AI 任務時要顯示的文字。
 startup_dm_sent = False  # 逐行註解：設定 startup_dm_sent 這個變數，供後面的流程使用。
 shutdown_dm_sent = False  # 逐行註解：設定 shutdown_dm_sent 這個變數，供後面的流程使用。
 weather_alert_monitor_task: asyncio.Task | None = None  # 逐行註解：保存天氣警報背景監控 task，避免 Discord 重連時重複啟動。
@@ -109,7 +108,8 @@ weather_alert_last_sent: dict[str, float] = {}  # 逐行註解：保存每種天
 
 # 預設文字聊天模型：用 qwen2.5-coder:1.5b 套繁中聊天 Modelfile。
 DEFAULT_CHAT_MODEL = "qwen2.5-coder:1.5b_chat"  # 逐行註解：設定 DEFAULT_CHAT_MODEL 這個變數，供後面的流程使用。
-AI_IDENTITY_NAME = "Smart_Sean"  # 逐行註解：設定 AI 自己的固定身份名稱，讓 Smart_Sean 在回答身份問題時思考這個角色，而不是直接回傳硬寫的文字。
+AI_IDENTITY_NAME = "Smart_Sean"  # 逐行註解：設定 AI 自己的固定身份名稱，避免永久記憶中的使用者姓名被誤當成 AI 名字。
+AI_IDENTITY_REPLY = "我是 Smart_Sean AI 助理。"  # 逐行註解：設定使用者詢問「你是誰」時的固定回答。
 
 # 天氣 API 初始化
 def get_env_value(*names):
@@ -1112,13 +1112,13 @@ class DuckDuckGoResultParser(HTMLParser):  # 逐行註解：定義類別 DuckDuc
     def handle_starttag(self, tag, attrs):  # 逐行註解：定義函式 handle_starttag，把一段會重複使用的流程包起來。
         attr = dict(attrs)  # 逐行註解：設定 attr 這個變數，供後面的流程使用。
         classes = set((attr.get("class") or "").split())  # 逐行註解：設定 classes 這個變數，供後面的流程使用。
-        # DuckDuckGo 的結果標題會放在 class="result__a" 或 "result-link" 的 <a> 裡。
-        if tag == "a" and ("result__a" in classes or "result-link" in classes):  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
+        # DuckDuckGo 的結果標題會放在 class="result__a" 的 <a> 裡。
+        if tag == "a" and "result__a" in classes:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
             self._in_title = True  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
             self._title_parts = []  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
             self._current_href = attr.get("href") or ""  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
-        # 搜尋摘要會放在 result__snippet 或 result-snippet，之後會接到最後一筆結果上。
-        elif "result__snippet" in classes or "result-snippet" in classes:  # 逐行註解：前面的 if 不成立時，改檢查這個額外條件。
+        # 搜尋摘要會放在 result__snippet，之後會接到最後一筆結果上。
+        elif "result__snippet" in classes:  # 逐行註解：前面的 if 不成立時，改檢查這個額外條件。
             self._in_snippet = True  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
             self._snippet_parts = []  # 逐行註解：把右邊算出的值存到左邊的變數或欄位。
 
@@ -1320,13 +1320,11 @@ async def search_web_results(question: str, *, limit: int = 5) -> list[dict[str,
         url = "https://html.duckduckgo.com/html/?q=" + urlparse.quote(question)  # 逐行註解：設定 url 這個變數，供後面的流程使用。
         req = urlrequest.Request(  # 逐行註解：開始一個跨多行的函式呼叫，下面幾行會放參數。
             url,  # 逐行註解：這行是跨行資料或參數的一個項目。
-            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},  # 逐行註解：使用更現代的 User-Agent 避免被擋。
+            headers={"User-Agent": "Mozilla/5.0"},  # 逐行註解：設定 headers 這個變數，供後面的流程使用。
             method="GET",  # 逐行註解：設定 method 這個變數，供後面的流程使用。
         )  # 逐行註解：結束上一個跨行函式呼叫或資料結構。
         with urlrequest.urlopen(req, timeout=15) as resp:  # 逐行註解：開啟需要自動收尾的資源，例如網路回應或檔案。
-            html = resp.read().decode("utf-8", errors="replace")  # 逐行註解：讀取 HTML 內容。
-            if "result__a" not in html and "result-link" not in html:  # 逐行註解：如果找不到任何搜尋結果的關鍵 class。
-                print(f"DEBUG: DuckDuckGo HTML 內容可能已變更或被擋。HTML 長度：{len(html)}")  # 逐行註解：印出除錯資訊。
+            html = resp.read().decode("utf-8", errors="replace")  # 逐行註解：設定 html 這個變數，供後面的流程使用。
         parser = DuckDuckGoResultParser()  # 逐行註解：設定 parser 這個變數，供後面的流程使用。
         parser.feed(html)  # 逐行註解：執行這一行，推進 Discord bot、Ollama 或網頁搜尋流程。
         return parser.results[:limit]  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
