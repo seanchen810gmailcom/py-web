@@ -1082,19 +1082,119 @@ def strip_markdown_json_code_block(raw_text: str) -> str:  # 逐行註解：清�
     return cleaned  # 逐行註解：沒有 code block 時回傳清理後原文。
 
 
+def balanced_json_object_text(cleaned_text: str, *, respect_strings: bool) -> str:  # 逐行註解：用大括號平衡方式擷取第一個 JSON object，不先依賴 json.loads。
+    start_index = str(cleaned_text or "").find("{")  # 逐行註解：找到第一個左大括號作為 JSON object 起點。
+    if start_index < 0:  # 逐行註解：找不到左大括號就代表沒有 JSON object。
+        return ""  # 逐行註解：回傳空字串，讓呼叫端改走 fallback。
+    depth = 0  # 逐行註解：記錄目前大括號巢狀深度。
+    in_string = False  # 逐行註解：記錄目前是否位在 JSON 字串內。
+    escaped = False  # 逐行註解：記錄上一個字元是否為反斜線跳脫。
+    for index in range(start_index, len(cleaned_text)):  # 逐行註解：從第一個大括號開始逐字掃描。
+        char = cleaned_text[index]  # 逐行註解：取出目前字元方便判斷。
+        if respect_strings and in_string:  # 逐行註解：字串內的大括號不應影響深度。
+            if escaped:  # 逐行註解：上一字元是反斜線時，這個字元只當一般內容。
+                escaped = False  # 逐行註解：跳脫狀態只作用一個字元。
+            elif char == "\\":  # 逐行註解：遇到反斜線時標記下一個字元被跳脫。
+                escaped = True  # 逐行註解：保存跳脫狀態。
+            elif char == "\"":  # 逐行註解：遇到未跳脫雙引號代表字串結束。
+                in_string = False  # 逐行註解：離開字串狀態。
+            continue  # 逐行註解：字串內不處理大括號深度。
+        if respect_strings and char == "\"":  # 逐行註解：在非字串狀態遇到雙引號代表字串開始。
+            in_string = True  # 逐行註解：進入字串狀態。
+            escaped = False  # 逐行註解：新字串開始時清除跳脫狀態。
+            continue  # 逐行註解：雙引號本身不影響大括號深度。
+        if char == "{":  # 逐行註解：遇到左大括號時增加深度。
+            depth += 1  # 逐行註解：進入更深一層 JSON object。
+        elif char == "}":  # 逐行註解：遇到右大括號時減少深度。
+            depth -= 1  # 逐行註解：結束一層 JSON object。
+            if depth == 0:  # 逐行註解：深度回到零代表第一個 JSON object 完整結束。
+                return cleaned_text[start_index:index + 1]  # 逐行註解：回傳第一個完整大括號區塊。
+    return ""  # 逐行註解：找不到完整大括號區塊時回傳空字串。
+
+
 def extract_first_json_object_text(raw_text: str) -> str:  # 逐行註解：從模型回覆中抓出第一個 JSON 物件文字。
     cleaned = strip_markdown_json_code_block(raw_text)  # 逐行註解：先清掉 markdown JSON code block，再進行 JSON 掃描。
-    decoder = json.JSONDecoder()  # 逐行註解：建立 JSON decoder，用 raw_decode 從任意位置解析。
-    for index, char in enumerate(cleaned):  # 逐行註解：逐字尋找可能的 JSON 物件起點。
-        if char != "{":  # 逐行註解：只有左大括號才可能是 JSON 物件開頭。
-            continue  # 逐行註解：不是大括號就繼續找下一個字元。
-        try:  # 逐行註解：嘗試從目前位置解析 JSON。
-            data, end_index = decoder.raw_decode(cleaned[index:])  # 逐行註解：解析目前位置開始的第一個 JSON 值。
-        except json.JSONDecodeError:  # 逐行註解：目前位置不是有效 JSON 時換下一個大括號。
-            continue  # 逐行註解：繼續尋找下一個可能位置。
-        if isinstance(data, dict):  # 逐行註解：圖表格式必須是 JSON object，也就是 Python dict。
-            return cleaned[index:index + end_index]  # 逐行註解：回傳剛剛成功解析的 JSON 物件文字。
-    return ""  # 逐行註解：找不到 JSON 物件時回傳空字串。
+    object_text = balanced_json_object_text(cleaned, respect_strings=True)  # 逐行註解：優先用正常 JSON 字串規則擷取物件。
+    if object_text:  # 逐行註解：如果正常擷取成功就直接回傳。
+        return object_text  # 逐行註解：回傳第一個完整 JSON object。
+    return balanced_json_object_text(cleaned, respect_strings=False)  # 逐行註解：壞引號導致失敗時，改用純大括號平衡救援。
+
+
+def repair_chart_labels_array_text(json_text: str) -> str:  # 逐行註解：修復 labels 陣列裡模型亂插的真實換行或逗號字串。
+    labels_pattern = re.compile(r'(?is)("labels"\s*:\s*)\[(.*?)\](\s*,\s*"values"\s*:)', re.DOTALL)  # 逐行註解：只鎖定 labels 陣列，不影響其他 JSON 欄位。
+    match = labels_pattern.search(json_text or "")  # 逐行註解：尋找 labels 到 values 之間的陣列內容。
+    if not match:  # 逐行註解：找不到 labels 陣列時不做文字修復。
+        return json_text  # 逐行註解：回傳原始 JSON 文字。
+    labels_body = match.group(2).replace("\r", "").replace("\n", "")  # 逐行註解：移除 labels 內的真實換行，避免 JSON 字串被拆壞。
+    labels_body = re.sub(r',\s*"\s*,\s*"', ',"', labels_body)  # 逐行註解：把 ["瓶果", ","橘子"] 這類壞片段修成 ["瓶果","橘子"]。
+    labels_body = re.sub(r'"\s*,\s*"\s*,\s*"', '","', labels_body)  # 逐行註解：把有效 JSON 裡多出的逗號字串項目移除。
+    return f"{json_text[:match.start()]}{match.group(1)}[{labels_body}]{match.group(3)}{json_text[match.end():]}"  # 逐行註解：把修好的 labels 陣列放回 JSON 原文。
+
+
+def clean_chart_json_text_before_load(raw_text: str) -> str:  # 逐行註解：在 json.loads 前清理模型可能輸出的壞 chart JSON。
+    json_text = extract_first_json_object_text(raw_text)  # 逐行註解：先從 AI 回覆中擷取第一個完整大括號區塊。
+    if not json_text:  # 逐行註解：沒有擷取到 JSON object 就無法清理。
+        return ""  # 逐行註解：回傳空字串，讓呼叫端改走 fallback。
+    json_text = repair_chart_labels_array_text(json_text)  # 逐行註解：先針對 labels 陣列做容錯修復。
+    json_text = json_text.replace("\r", "").replace("\n", " ")  # 逐行註解：把剩餘真實換行換成空白，避免 JSON 字串內換行導致 loads 失敗。
+    return json_text.strip()  # 逐行註解：回傳準備交給 json.loads 的修復後 JSON。
+
+
+def clean_chart_label_from_model(raw_label) -> str:  # 逐行註解：清理模型 JSON labels 裡的單一標籤。
+    label = str(raw_label or "").replace("\r", "").replace("\n", "").strip()  # 逐行註解：移除真實換行並清理前後空白。
+    label = label.strip(" \t,，、;；")  # 逐行註解：移除只代表分隔符的逗號或頓號。
+    return label  # 逐行註解：回傳清理後標籤，可能是空字串。
+
+
+def normalize_chart_labels_from_model(raw_labels) -> list[str] | None:  # 逐行註解：整理模型回傳的 labels，過濾空字串與只有逗號的項目。
+    if not isinstance(raw_labels, list):  # 逐行註解：labels 必須是 JSON array。
+        return None  # 逐行註解：格式錯誤時回傳 None。
+    normalized_labels: list[str] = []  # 逐行註解：建立整理後標籤清單。
+    for raw_label in raw_labels:  # 逐行註解：逐一檢查每個模型標籤。
+        label = clean_chart_label_from_model(raw_label)  # 逐行註解：清理單一標籤。
+        if not label:  # 逐行註解：空字串、換行或逗號項目都不要保留。
+            continue  # 逐行註解：略過無效標籤。
+        normalized_labels.append(label)  # 逐行註解：加入有效標籤。
+    return normalized_labels  # 逐行註解：回傳已過濾標籤清單。
+
+
+def normalize_chart_values_from_model(raw_values) -> list[int | float] | None:  # 逐行註解：整理模型回傳的 values，全部轉成數字。
+    if not isinstance(raw_values, list):  # 逐行註解：values 必須是 JSON array。
+        return None  # 逐行註解：格式錯誤時回傳 None。
+    normalized_values: list[int | float] = []  # 逐行註解：建立整理後數值清單。
+    for raw_value in raw_values:  # 逐行註解：逐一檢查每個模型數值。
+        try:  # 逐行註解：數值轉換可能失敗，所以用 try 保護。
+            number_value = float(raw_value)  # 逐行註解：允許 int、float 或數字字串轉成 float。
+        except (TypeError, ValueError):  # 逐行註解：無法轉成數字時代表圖表資料不可用。
+            return None  # 逐行註解：回傳 None 讓呼叫端停止圖表流程。
+        normalized_values.append(int(number_value) if number_value.is_integer() else number_value)  # 逐行註解：整數值保留成 int，其他值保留 float。
+    return normalized_values  # 逐行註解：回傳整理後數值清單。
+
+
+def normalize_chart_payload_from_model(data: dict) -> dict | None:  # 逐行註解：將模型 chart JSON 統一修成可繪圖 payload。
+    if not isinstance(data, dict):  # 逐行註解：圖表資料必須是 JSON object。
+        return None  # 逐行註解：格式錯誤時回傳 None。
+    if str(data.get("type") or "").strip().lower() != "chart":  # 逐行註解：只有 type=chart 才啟動圖表輸出。
+        return None  # 逐行註解：不是圖表 JSON 時改走一般文字流程。
+    chart_type = normalize_chart_type_name(data.get("chart_type"))  # 逐行註解：讀取並整理圖表類型。
+    if chart_type not in CHART_TYPE_NAMES:  # 逐行註解：圖表類型只允許 bar、line、pie。
+        print_chart_traceback(f"不支援的 chart_type：{chart_type}")  # 逐行註解：支援外的類型要完整印出 traceback。
+        return None  # 逐行註解：不支援的圖表類型改走一般文字流程。
+    normalized_labels = normalize_chart_labels_from_model(data.get("labels"))  # 逐行註解：整理並過濾 labels。
+    normalized_values = normalize_chart_values_from_model(data.get("values"))  # 逐行註解：整理並轉換 values。
+    if normalized_labels is None or normalized_values is None:  # 逐行註解：labels 或 values 格式錯誤時不能畫圖。
+        print_chart_traceback("labels 或 values 不是可用 JSON array")  # 逐行註解：資料格式錯誤時完整印 traceback。
+        return None  # 逐行註解：資料格式不符時改走一般文字流程。
+    if not normalized_labels or len(normalized_labels) != len(normalized_values):  # 逐行註解：過濾後 labels 數量必須和 values 數量一致。
+        print_chart_traceback("labels 與 values 數量不一致或為空")  # 逐行註解：資料數量錯誤時完整印 traceback。
+        return None  # 逐行註解：資料數量不符時改走一般文字流程。
+    return {  # 逐行註解：回傳標準化後的圖表資料。
+        "type": "chart",  # 逐行註解：保留圖表型別。
+        "chart_type": chart_type,  # 逐行註解：保存圖表種類。
+        "title": str(data.get("title") or CHART_TYPE_NAMES[chart_type]).strip(),  # 逐行註解：保存圖表標題。
+        "labels": normalized_labels,  # 逐行註解：保存整理後標籤。
+        "values": normalized_values,  # 逐行註解：保存整理後數值。
+    }  # 逐行註解：結束標準化圖表資料。
 
 
 def fallback_chart_payload_from_raw_user_text(fallback_user_text: str) -> dict | None:  # 逐行註解：在模型 JSON 解析失敗時，用使用者原始訊息建立圖表資料。
@@ -1109,7 +1209,7 @@ def parse_chart_reply(raw_text: str, fallback_user_text: str = "") -> dict | Non
     if should_debug_response:  # 逐行註解：如果像圖表 JSON，就依需求印出 AI 原始回覆。
         debug_ai_response(response)  # 逐行註解：印出 AI RESPONSE 區塊。
     try:  # 逐行註解：JSON 解析可能失敗，所以用 try 保護。
-        json_text = extract_first_json_object_text(response)  # 逐行註解：先從模型回覆抽出 JSON 物件。
+        json_text = clean_chart_json_text_before_load(response)  # 逐行註解：在 json.loads 前先擷取並修復 chart JSON。
         if not json_text:  # 逐行註解：沒有 JSON 就代表是一般文字回答或模型格式錯誤。
             if should_debug_response:  # 逐行註解：看起來像圖表 JSON 卻抓不到物件時要印 traceback。
                 print_chart_traceback("找不到可解析的 JSON object")  # 逐行註解：完整記錄解析失敗原因。
@@ -1125,40 +1225,9 @@ def parse_chart_reply(raw_text: str, fallback_user_text: str = "") -> dict | Non
         if fallback_payload:  # 逐行註解：如果 fallback 成功建立圖表資料。
             return fallback_payload  # 逐行註解：回傳 fallback 圖表資料，不讓壞 JSON 影響使用者。
         return None  # 逐行註解：解析失敗時改走一般文字流程。
-    if not isinstance(data, dict):  # 逐行註解：圖表資料必須是 JSON object。
-        return None  # 逐行註解：格式不符時改走一般文字流程。
-    if str(data.get("type") or "").strip().lower() != "chart":  # 逐行註解：只有 type=chart 才啟動圖表輸出。
-        return None  # 逐行註解：不是圖表 JSON 時改走一般文字流程。
-    chart_type = normalize_chart_type_name(data.get("chart_type"))  # 逐行註解：讀取並整理圖表類型。
-    if chart_type not in CHART_TYPE_NAMES:  # 逐行註解：圖表類型只允許 bar、line、pie。
-        print_chart_traceback(f"不支援的 chart_type：{chart_type}")  # 逐行註解：支援外的類型要完整印出 traceback。
-        return None  # 逐行註解：不支援的圖表類型改走一般文字流程。
-    labels = data.get("labels")  # 逐行註解：讀取圖表標籤清單。
-    values = data.get("values")  # 逐行註解：讀取圖表數值清單。
-    if not isinstance(labels, list) or not isinstance(values, list):  # 逐行註解：labels 和 values 都必須是 JSON array。
-        print_chart_traceback("labels 或 values 不是 JSON array")  # 逐行註解：資料格式錯誤時完整印 traceback。
-        return None  # 逐行註解：資料格式不符時改走一般文字流程。
-    if not labels or len(labels) != len(values):  # 逐行註解：資料不可空，標籤與數值數量也必須相同。
-        print_chart_traceback("labels 與 values 數量不一致或為空")  # 逐行註解：資料數量錯誤時完整印 traceback。
-        return None  # 逐行註解：資料數量不符時改走一般文字流程。
-    normalized_labels = [str(label).strip() for label in labels]  # 逐行註解：將標籤統一轉成字串。
-    normalized_values: list[float] = []  # 逐行註解：建立整理後的數值清單。
-    for value in values:  # 逐行註解：逐一整理每個圖表數值。
-        try:  # 逐行註解：數值轉換可能失敗，所以用 try 保護。
-            normalized_values.append(float(value))  # 逐行註解：允許 int、float 或數字字串轉成 float。
-        except (TypeError, ValueError):  # 逐行註解：遇到無法轉成數字的值時停止圖表流程。
-            print_chart_traceback(f"values 包含無法轉成數字的值：{value}")  # 逐行註解：數值錯誤時完整印 traceback。
-            return None  # 逐行註解：資料不合法時改走一般文字流程。
-    if any(not label for label in normalized_labels):  # 逐行註解：空標籤會讓圖表難以閱讀。
-        print_chart_traceback("labels 包含空字串")  # 逐行註解：空標籤錯誤時完整印 traceback。
-        return None  # 逐行註解：有空標籤時改走一般文字流程。
-    chart_data = {  # 逐行註解：建立標準化後的圖表資料。
-        "type": "chart",  # 逐行註解：保留圖表型別。
-        "chart_type": chart_type,  # 逐行註解：保存圖表種類。
-        "title": str(data.get("title") or CHART_TYPE_NAMES[chart_type]).strip(),  # 逐行註解：保存圖表標題。
-        "labels": normalized_labels,  # 逐行註解：保存整理後標籤。
-        "values": normalized_values,  # 逐行註解：保存整理後數值。
-    }  # 逐行註解：結束標準化圖表資料。
+    chart_data = normalize_chart_payload_from_model(data)  # 逐行註解：統一整理 chart_type、labels 與 values。
+    if chart_data is None:  # 逐行註解：不是合法圖表 payload 時改走一般文字流程。
+        return None  # 逐行註解：回傳 None 讓呼叫端自行處理。
     print("偵測到圖表 JSON")  # 逐行註解：除錯輸出，確認程式真的有攔截 chart JSON。
     print(chart_data)  # 逐行註解：除錯輸出，印出已解析的圖表資料。
     debug_json_parsed(chart_data)  # 逐行註解：依需求印出 JSON PARSED 區塊。
@@ -3507,6 +3576,7 @@ def build_youtube_summary_prompt(title: str, transcript_text: str, subtitle_lang
 
 #######################統一日誌記錄系統#######################
 _hourly_forecast_error_shown = False  # 保存 hourly forecast 錯誤是否已顯示過，避免重複列印。
+DEBUG_MODE = str(os.getenv("DEBUG", "")).strip().lower() in {"1", "true", "yes", "on", "debug"}  # 逐行註解：只有 DEBUG 模式才顯示非致命 fallback 警告。
 
 
 def sanitize_log_value(param_name: str, value: any) -> str:  # 根據參數名稱隱藏敏感值。
@@ -6159,8 +6229,8 @@ def fetch_openweather_hourly_forecast(city_name: str) -> dict | None:  # 優先�
             last_error = "hourly list 為空"  # 保存 list 缺失原因。
         except Exception as exc:  # 捕捉任何 hourly endpoint 失敗，之後可退回 forecast。
             last_error = f"{type(exc).__name__}: {str(exc)[:120]}"  # 保存安全錯誤摘要。
-    if not _hourly_forecast_error_shown:  # 只在第一次時列印錯誤。
-        print(f"Hourly Forecast 不可用，已改用一般 forecast。此訊息只顯示一次。原因：{last_error}")  # 後台說明 fallback 原因，不傳到 Discord。
+    if DEBUG_MODE and not _hourly_forecast_error_shown:  # 逐行註解：只有 DEBUG 模式才列印 hourly fallback 警告。
+        print(f"DEBUG: Hourly Forecast 不可用，已改用一般 forecast。此訊息只顯示一次。原因：{last_error}")  # 逐行註解：後台說明 fallback 原因，不傳到 Discord。
         _hourly_forecast_error_shown = True  # 標記錯誤已顯示，避免重複列印。
     return None  # 回傳 None 讓呼叫端改用 forecast。
 
