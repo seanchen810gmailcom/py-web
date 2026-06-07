@@ -404,7 +404,7 @@ def _item_rain_mm(item: dict) -> float | None:  # 從 forecast 單筆資料估�
     return None  # 沒有雨量資料時回傳 None。
 
 
-def get_weather_alert_messages(weather_data: dict) -> list[str]:  # 產生需要主動通知的危險天氣訊息。
+def get_weather_alert_messages(weather_data: dict) -> list[str]:  # 產生危險天氣風險訊息。
     items = _forecast_items(weather_data)  # 取得 forecast 或 hourly 預報資料。
     hourly_rows = _hourly_snapshots(weather_data) if items else []  # 有預報資料時整理成 24 小時快照。
     descriptions = _summary_descriptions(weather_data, hourly_rows)  # 整理所有天氣描述文字。
@@ -413,7 +413,7 @@ def get_weather_alert_messages(weather_data: dict) -> list[str]:  # 產生需要
     wind_speed = _maximum([row.get("wind_speed") for row in hourly_rows]) if hourly_rows else None  # 計算 24 小時最大平均風速。
     wind_gust = _maximum([_wind_data(item).get("gust") for item in items]) if items else None  # 計算 forecast 原始資料中的最大陣風。
     rain_amount = _maximum([_item_rain_mm(item) for item in items]) if items else None  # 計算 forecast 原始資料中的最大雨量。
-    alerts: list[str] = []  # 建立主動通知訊息清單。
+    alerts: list[str] = []  # 建立危險天氣風險訊息清單。
     has_rain = _contains_any_weather_word(descriptions, ("rain", "drizzle", "shower", "雨"))  # 判斷是否有雨相關描述。
     if _contains_any_weather_word(descriptions, ("typhoon", "hurricane", "tropical cyclone", "颱風", "台風", "熱帶氣旋")):  # 偵測颱風或熱帶氣旋。
         alerts.append("颱風或熱帶氣旋風險：請固定門窗與陽台物品，避免前往海邊、山區、河岸和空曠強風處。")  # 加入颱風通知。
@@ -429,7 +429,7 @@ def get_weather_alert_messages(weather_data: dict) -> list[str]:  # 產生需要
         alerts.append("土石流與邊坡風險：山區、溪邊、邊坡道路請提高警覺，避免進入封閉步道或溪床。")  # 加入土石流通知。
     if (wind_speed is not None and wind_speed >= 10.8) or (wind_gust is not None and wind_gust >= 15):  # 依平均風或陣風判斷強風。
         alerts.append("強風風險：騎車、撐傘、高架橋路段與空曠處請放慢速度，陽台物品先收好。")  # 加入強風通知。
-    return alerts  # 回傳需要主動通知的警報清單，沒有危險時回傳空清單。
+    return alerts  # 回傳危險天氣風險清單，沒有危險時回傳空清單。
 
 
 def get_current_weather_summary(weather_data: dict) -> str:  # 產生當天天氣摘要文字。
