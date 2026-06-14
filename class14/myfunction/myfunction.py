@@ -108,22 +108,40 @@ class AIAssistant:
         self.api_key=api_key
         openai.api_key=api_key #設定AI套件的API金鑰，讓它可以用來和OpenAI溝通
 
-    def ask(self, system_prompt, user_message, temperature=0.2, model="gpt-4o"):
-        """進行一次 AI 對話，適合單次任務（如天氣分析）。"""
+    def ask(
+            self,
+            system_prompt,
+            user_message,
+            history_messages=None,
+            temperature=0.2,
+            model="gpt-4o"
+    ):
+        """進行一次AI對話，也可以帶入整理好得對話歷史"""
+        
         # 這個方法讓我們可以問AI一個問題，並得到一次性的回答。
         # system_prompt 是給AI的背景設定，告訴它你希望它扮演什麼角色、用什麼口吻回答。
         # user_message 是你要問AI的問題或提供的資料。
+        # history_messages 是之前的對話歷史，如果有的話就一起給AI，讓它知道之前說過什麼。
         
         # 如果沒有設金鑰，直接回傳錯誤訊息
         if not self.api_key:
             return None, "尚未設定OpenAI API金鑰，無法使用AI功能。"
+        if history_messages is None:
+            history_messages = []
+        
         # messages的順序很重要
         # 1. syste：先告訴AI要扮演什麼角色
-        # 2. user：再放這次真正要問的新問題
-        messages = ([{"role": "system", "content": system_prompt}] +
+        # 2. history：放入已經整理好得舊對話
+        # 3. user：最後放入這次要問AI的問題，讓它知道現在要回答什麼
+        messages = ([{"role": "system", "content": system_prompt}] + history_messages +
                     [{"role": "user", "content": user_message}])
+
+        print("=== 傳給OpenAI的訊息 ===")
+        for msg in messages:
+            print(f"{msg['role']}: {msg['content']}")
+        print("=========================")
         try:
-            # 像OpenAI送出請求
+            # 像OpenAI送出請求ㄎ
             response = openai.chat.completions.create(
                 model=model,
                 messages=messages,
