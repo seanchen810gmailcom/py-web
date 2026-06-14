@@ -29,6 +29,26 @@ weather_api = WwatherAPI(weather_api_key) # 建立天氣API物件，讓後面可
 # AIAssistant 是新增的工具類別，專門用來好OpenAI對話
 # 把OpenAI金鑰交給他，之後就能用ask()方法來講AI分析資料
 ai_assistant = AIAssistant(os.getenv("OPENAI_API_KEY"))
+
+# 限制讀取的歷史訊息數量
+CHANNEL_HISTORY_LIMIT = 15
+
+# system_prompt 是我們給AI的「角色設定」，讓他知道自己是誰、要做什麼。
+CHAT_SYSTEM_PROMPT = """
+你是一個在 Discord 群組頻道中協助大家的 AI 助手。
+請根據頻道歷史判斷大家正在討論什麼，再回答最新提到你的問題。
+回覆請使用繁體中文，語氣自然、簡短、適合國小學生閱讀。
+如果頻道歷史不足以判斷答案，請說明你還需要哪一個資訊。
+如果需要提到特定使用者或其他 bot，請複製歷史訊息裡的 mention：<@使用者ID>。
+使用 mention 時，請直接放在一般文字中，不要寫成 @名字，也不要加反斜線、反引號或程式碼區塊。
+不要使用 @everyone、@here 或角色標記，也不要自己編造 mention ID。
+"""
+AI_RETRY_ALLOWED_MENTTIONS = discord.AllowedMentions(
+    everyone=False,
+    users=True,
+    roles=False,
+    replied_user=True,
+)
 def build_weather_enbed(weather_summary):
     """把整理好的天氣摘要排成Discord 卡牌。"""
     # weather_summary 已經是整理好的資料
@@ -73,6 +93,39 @@ def build_forecast_embeds(forecast_summary):
         embeds.append(embed)
 
     return embeds
+async def get_channel_history(channel,bot_user,limit=15,before=None):
+    """讀取Discord 頻道中的舊訊息，整理成OpenAI可以使用的messages"""
+    old_messages = []
+    history_messages = []
+    # Discord API 讀頻道訊息時，預設會先拿教新的訊息。
+    # 這裡先明確抓「最近的幾則」，把「抓資料」和「排成對話順序」分成兩步。
+    # oldest_first=False代表先拿最接近before的新訊息。
+    # 下面再反轉成「舊到新」交給AI，比較像大家平常閱讀對話的順序。
+    async for old_message in channel.history(
+        limit-limit,
+        before=before,
+        oldest_first=False
+    ):
+        old_messages.append(old_message)
+
+# Discord 抓回來的是「新到舊」，但AI閱讀對話時需要「舊到新」
+    for old_message in reversed(old_messages):
+        #這裡使用message.content，而不是clean_content
+        # message.content 會保留<@使用者ID>這種真正得mention格式。
+        content = old_message.content.strip()
+        if not content:
+            continue
+
+        if old_message.author.id == bot_user.id:
+            history_messages.append({"role":"assistant", "content": content})
+        else:
+            # 其他同學和其他bot都標上名字，AI才知道是誰說得。
+            speaker_type = "機器人" if old_message.author.bot else "同學"
+            speaker_mention = old_message.author.mention
+            user_content = (
+                f"{old_message.author.display_name}"
+                f"（{speaker_type}，mention：{speaker_mention}）說：{content}"
+            )
 #######################事件#######################
 """
 @bot.event 這種寫法叫做裝飾器，
