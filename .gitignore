@@ -41,6 +41,10 @@ htmlcov/
 .env.local
 .DS_Store
 
+# Local secrets
+class10/Super_Discord_bot/google_oauth_client_secret.json
+class10/Super_Discord_bot/google_tokens/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 

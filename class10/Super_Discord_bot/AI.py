@@ -15,6 +15,7 @@ import io  # 匯入 io：讓 PDF bytes 可以像檔案一樣交給 pdfplumber �
 import zipfile  # 匯入 zipfile：讀取 docx、pptx、xlsx 這類本質是 zip 的 Office 檔案。
 import xml.etree.ElementTree as ET  # 匯入 ElementTree：解析 Office 檔案內部 XML 文字內容。
 import base64  # 匯入 base64：把圖片 bytes 編碼成 Ollama vision API 可以接收的文字格式。
+from email.message import EmailMessage  # 匯入 EmailMessage：建立 Gmail API 可接受的 RFC 2822 郵件內容。
 import uuid  # 匯入 uuid：產生不重複的圖片檔名，避免不同圖片輸出時互相覆蓋。
 from datetime import datetime, timedelta, timezone  # 匯入 datetime/timedelta/timezone：產生時間戳、解析 Google Calendar 時間範圍與處理時區。
 from urllib import request as urlrequest  # 匯入 urllib.request 並命名為 urlrequest：負責發 HTTP 請求、搜尋網頁、讀網頁內容。
@@ -28,6 +29,7 @@ import subprocess  # 匯入 subprocess：執行 macOS 指令，例如 pmset、po
 import shutil  # 匯入 shutil：檢查 istats、osx-cpu-temp、smc 這類外部工具是否存在。
 import shlex  # 匯入 shlex：把檔名或路徑安全包成 shell command 可以使用的字串。
 import tempfile  # 匯入 tempfile：暫存使用者上傳的舊 Office 檔，交給 macOS textutil 嘗試轉文字。
+import mimetypes  # 匯入 mimetypes：Drive 上傳檔案時依副檔名推測 MIME type。
 import traceback  # 匯入 traceback：圖表 JSON 或繪圖流程失敗時印出完整錯誤堆疊。
 import requests  # 匯入 requests：用來查詢天氣 API 和其他 HTTP 請求。
 from myfunction.myfunction import WwatherAPI  # 匯入 WwatherAPI：天氣查詢工具類別。
@@ -95,10 +97,11 @@ ALLOWED_USER_LIST = load_env_list("ALLOWED_USERS")  # 逐行註解：讀取一�
 SUPER_USER_KEYS = set(SUPER_USER_LIST)  # 逐行註解：建立超級使用者集合，讓每次權限判斷能快速查找。
 ALLOWED_USER_KEYS = set(ALLOWED_USER_LIST)  # 逐行註解：建立一般允許使用者集合，讓每次權限判斷能快速查找。
 CONFIGURED_PERMISSION_EMAIL_ALIASES = {key.split("@", 1)[0]: key for key in (SUPER_USER_KEYS | ALLOWED_USER_KEYS) if "@" in key and key.split("@", 1)[0]}  # 逐行註解：把設定中的 email local-part 對應回完整 email，支援 Discord 名稱對應 email。
-SENSITIVE_COMMAND_NAMES = {"agent", "state", "run", "quit", "restart", "shell", "shutdown", "reload", "eval", "exec", "debug", "admin", "web_search"}  # 逐行註解：集中列出所有只能 SUPER_USERS 使用的敏感指令名稱，包含 web_search 以觸發 Sean 審核流程。
+SENSITIVE_COMMAND_NAMES = {"agent", "state", "run", "quit", "restart", "shell", "shutdown", "reload", "eval", "exec", "debug", "admin", "web_search", "google_workspace"}  # 逐行註解：集中列出所有只能 SUPER_USERS 使用的敏感指令名稱，包含 web_search 與 google_workspace。
 DISCORD_BOT_QUIT_PASSWORD = os.getenv("DISCORD_BOT_QUIT_PASSWORD", "").strip()  # 逐行註解：設定 DISCORD_BOT_QUIT_PASSWORD 這個變數，供後面的流程使用。
 NO_PERMISSION_MESSAGE = "You're not allowed to use this bot."  # 逐行註解：統一設定未在 ALLOWED_USERS 或 SUPER_USERS 時的拒絕文字。
 SENSITIVE_PERMISSION_MESSAGE = "Not super user, asking Sean"  # 逐行註解：統一設定非 SUPER_USERS 使用敏感功能時的拒絕文字，同時表示已通知 Sean 審核。
+GOOGLE_WORKSPACE_SUPER_PERMISSION_MESSAGE = "not Super user"  # 逐行註解：統一設定非 SUPER_USER 使用 /google_workspace 時的指定拒絕文字。
 STOP_AI_MESSAGE = "⏹️ Stop Thinking"  # 逐行註解：統一設定 /stop 成功停止 AI 任務時要顯示的文字。
 startup_dm_sent = False  # 逐行註解：設定 startup_dm_sent 這個變數，供後面的流程使用。
 shutdown_dm_sent = False  # 逐行註解：設定 shutdown_dm_sent 這個變數，供後面的流程使用。
@@ -339,6 +342,11 @@ async def send_interaction_permission_denied(interaction: discord.Interaction, m
 
 async def permission_interaction_check(interaction: discord.Interaction) -> bool:  # 逐行註解：CommandTree 全域權限檢查，所有 slash command 都先經過這裡。
     command_name = interaction_command_name(interaction)  # 逐行註解：取得目前指令名稱，判斷是否屬於敏感功能。
+    if command_name == "google_workspace":  # 逐行註解：Google Workspace 必須優先套用專用 SUPER_USER 拒絕文字。
+        if require_super_user(interaction.user):  # 逐行註解：只有 SUPER_USERS 可以繼續執行 /google_workspace。
+            return True  # 逐行註解：SUPER_USER 通過後讓 command body 執行。
+        await send_interaction_permission_denied(interaction, GOOGLE_WORKSPACE_SUPER_PERMISSION_MESSAGE)  # 逐行註解：非 SUPER_USER 固定回覆使用者指定文字。
+        return False  # 逐行註解：阻止非 SUPER_USER 執行 /google_workspace。
     if command_name in SENSITIVE_COMMAND_NAMES:  # 逐行註解：敏感指令必須是 SUPER_USERS。
         if require_super_user(interaction.user):  # 逐行註解：超級使用者可以繼續執行敏感指令。
             return True  # 逐行註解：回傳 True 讓 command body 執行。
@@ -4272,6 +4280,11 @@ async def on_message(message):  # 逐行註解：定義非同步函式 on_messag
     if message.author == bot.user: # 如果這則訊息的作者是機器人自己，就不理他（避免無限循環）
         return  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
 
+    if not require_super_user(message.author) and google_workspace_text_mentions((message.content or ""), GOOGLE_WORKSPACE_TASK_KEYWORDS):  # 逐行註解：非 SUPER_USER 只要用一般文字要求 Google Workspace 任務，就先用專用規則拒絕。
+        if should_reply_no_permission_to_message(message):  # 逐行註解：沿用原本 DM 或提及 bot 才回覆的防洗版規則。
+            await message.channel.send(google_workspace_permission_message())  # 逐行註解：非 SUPER_USER 使用 Workspace 功能固定回覆 not Super user。
+        return  # 逐行註解：Workspace 權限拒絕後不再進入一般聊天或一般權限訊息。
+
     if not is_allowed_message_user(message):  # 逐行註解：任何一般訊息都先檢查 ALLOWED_USERS 與 SUPER_USERS。
         if should_reply_no_permission_to_message(message):  # 逐行註解：DM 一定回覆；伺服器只有提到 bot 才回覆，避免洗版。
             await message.channel.send(NO_PERMISSION_MESSAGE)  # 逐行註解：回覆需求指定的未授權文字。
@@ -4747,6 +4760,7 @@ async def stop_ai(interaction: discord.Interaction):  # 逐行註解：定義 /s
 
 GOOGLE_WORKSPACE_MODEL = "gemma4_thinking"  # 逐行註解：Google Workspace 模式固定切換到既有 gemma4_thinking 模型。
 GOOGLE_WORKSPACE_MEMORY_TYPE = "google_workspace"  # 逐行註解：在使用者自己的 memories JSON 中標記 Google Workspace 設定項目。
+GOOGLE_WORKSPACE_OAUTH_TIMEOUT_SECONDS = 180  # 逐行註解：Google OAuth 最多等待 180 秒，避免 Discord interaction 永遠卡在思考中。
 GOOGLE_WORKSPACE_TOOLS: list[tuple[str, str, str]] = [  # 逐行註解：定義 /google_workspace 選單可選工具，總數低於 Discord Select 25 個限制。
     ("google_auto", "Auto", "自動判斷要使用的 Workspace 工具"),  # 逐行註解：Auto 模式會依後續訊息內容自動選工具。
     ("google_doc", "Google Docs", "文件撰寫、整理、格式化"),  # 逐行註解：Google 文件工具。
@@ -4781,12 +4795,16 @@ GOOGLE_WORKSPACE_TOKEN_DIR.mkdir(parents=True, exist_ok=True)  # 逐行註解：
 GOOGLE_WORKSPACE_TAIPEI_TZ = timezone(timedelta(hours=8))  # 逐行註解：Google Calendar 時間預設使用台北時區。
 GOOGLE_WORKSPACE_SCOPES: tuple[str, ...] = (  # 逐行註解：集中定義本 bot 需要的 Google API 權限範圍。
     "https://www.googleapis.com/auth/drive",  # 逐行註解：允許列出、讀取、建立與更新 Google Drive 檔案。
-    "https://www.googleapis.com/auth/documents",  # 逐行註解：允許讀取與編輯 Google Docs。
-    "https://www.googleapis.com/auth/presentations",  # 逐行註解：允許讀取與建立 Google Slides。
-    "https://www.googleapis.com/auth/spreadsheets",  # 逐行註解：允許讀取 Google Sheets 結構。
-    "https://www.googleapis.com/auth/calendar",  # 逐行註解：允許讀取、新增與刪除 Google Calendar 行程。
-    "https://www.googleapis.com/auth/gmail.readonly",  # 逐行註解：允許讀取 Gmail 郵件摘要與內容。
-    "https://www.googleapis.com/auth/gmail.compose",  # 逐行註解：允許建立 Gmail 草稿但不直接寄出。
+    "https://www.googleapis.com/auth/documents",  # 逐行註解：允許建立、讀取、更新與清空 Google Docs。
+    "https://www.googleapis.com/auth/presentations",  # 逐行註解：允許建立、讀取與更新 Google Slides。
+    "https://www.googleapis.com/auth/spreadsheets",  # 逐行註解：允許建立、讀取與更新 Google Sheets。
+    "https://www.googleapis.com/auth/calendar",  # 逐行註解：允許讀取、新增、修改、刪除與回覆 Google Calendar 行程。
+    "https://www.googleapis.com/auth/gmail.modify",  # 逐行註解：允許讀取、標籤、封存、刪除與整理 Gmail。
+    "https://www.googleapis.com/auth/gmail.compose",  # 逐行註解：允許建立 Gmail 草稿。
+    "https://www.googleapis.com/auth/gmail.send",  # 逐行註解：允許依使用者要求直接寄出 Gmail。
+    "https://www.googleapis.com/auth/contacts",  # 逐行註解：允許 Google Contacts 列出、搜尋、新增、修改與刪除聯絡人。
+    "https://www.googleapis.com/auth/forms.body",  # 逐行註解：允許建立、讀取與更新 Google Forms 表單本體。
+    "https://www.googleapis.com/auth/forms.responses.readonly",  # 逐行註解：允許讀取 Google Forms 回覆。
 )  # 逐行註解：結束 Google API 權限範圍。
 GOOGLE_WORKSPACE_MIME_TYPES: dict[str, str] = {  # 逐行註解：把 Workspace 工具對應到 Google Drive MIME type。
     "google_doc": "application/vnd.google-apps.document",  # 逐行註解：Google Docs 的 Drive MIME type。
@@ -4806,24 +4824,119 @@ GOOGLE_WORKSPACE_TASK_KEYWORDS: tuple[str, ...] = (  # 逐行註解：辨識後�
     "workspace",  # 逐行註解：使用者明講 Workspace 時接管。
     "檔案",  # 逐行註解：檔案操作通常屬於 Drive。
     "文件",  # 逐行註解：文件操作通常屬於 Docs 或 Drive。
+    "doc",  # 逐行註解：英文 doc 代表 Google Docs 或文件操作。
+    "docs",  # 逐行註解：英文 docs 代表 Google Docs 或文件操作。
+    "document",  # 逐行註解：英文 document 代表文件操作。
+    "documents",  # 逐行註解：英文 documents 代表文件清單或文件操作。
     "簡報",  # 逐行註解：簡報操作通常屬於 Slides。
     "投影片",  # 逐行註解：投影片操作通常屬於 Slides。
+    "slide",  # 逐行註解：英文 slide 代表 Google Slides 或單張投影片。
+    "slides",  # 逐行註解：英文 slides 代表 Google Slides。
+    "presentation",  # 逐行註解：英文 presentation 代表簡報。
+    "presentations",  # 逐行註解：英文 presentations 代表簡報清單或簡報操作。
     "試算表",  # 逐行註解：試算表操作通常屬於 Sheets。
     "表格",  # 逐行註解：表格操作可能屬於 Sheets。
+    "sheet",  # 逐行註解：英文 sheet 代表 Google Sheets 或單張工作表。
+    "sheets",  # 逐行註解：英文 sheets 代表 Google Sheets。
+    "spreadsheet",  # 逐行註解：英文 spreadsheet 代表試算表。
+    "spreadsheets",  # 逐行註解：英文 spreadsheets 代表試算表清單或試算表操作。
     "表單",  # 逐行註解：表單操作通常屬於 Forms。
+    "form",  # 逐行註解：英文 form 代表 Google Forms。
+    "forms",  # 逐行註解：英文 forms 代表 Google Forms 清單或表單操作。
     "行事曆",  # 逐行註解：行事曆操作屬於 Calendar。
     "日曆",  # 逐行註解：日曆操作屬於 Calendar。
     "行程",  # 逐行註解：行程操作屬於 Calendar。
+    "calendar",  # 逐行註解：英文 calendar 代表 Google Calendar。
+    "event",  # 逐行註解：英文 event 代表行程。
+    "events",  # 逐行註解：英文 events 代表行程清單。
     "會議",  # 逐行註解：會議可能屬於 Calendar 或 Meet。
+    "meeting",  # 逐行註解：英文 meeting 代表會議或行程。
+    "meet",  # 逐行註解：英文 meet 代表 Google Meet 或會議。
+    "drive",  # 逐行註解：英文 drive 代表 Google Drive 檔案操作。
     "gmail",  # 逐行註解：使用者明講 Gmail 時接管。
     "email",  # 逐行註解：使用者明講 email 時接管。
+    "mail",  # 逐行註解：英文 mail 代表 Gmail 郵件操作。
     "郵件",  # 逐行註解：郵件操作屬於 Gmail。
     "信件",  # 逐行註解：信件操作屬於 Gmail。
     "草稿",  # 逐行註解：草稿操作屬於 Gmail。
+    "draft",  # 逐行註解：英文 draft 代表 Gmail 草稿。
+    "compose",  # 逐行註解：英文 compose 代表撰寫 Gmail 草稿。
     "寄信",  # 逐行註解：寄信需求先建立 Gmail 草稿。
+    "收件者",  # 逐行註解：郵件任務常用收件者欄位。
+    "聯絡人",  # 逐行註解：聯絡人操作屬於 Google Contacts。
+    "通訊錄",  # 逐行註解：通訊錄操作屬於 Google Contacts。
+    "contact",  # 逐行註解：英文 contact 代表 Google Contacts。
+    "contacts",  # 逐行註解：英文 contacts 代表 Google Contacts 清單或操作。
+    "資料夾",  # 逐行註解：資料夾操作屬於 Google Drive。
+    "folder",  # 逐行註解：英文 folder 代表 Drive 資料夾。
+    "upload",  # 逐行註解：英文 upload 代表 Drive 上傳。
+    "download",  # 逐行註解：英文 download 代表 Drive 下載。
     "設定",  # 逐行註解：設定查詢會顯示目前 Workspace 設定。
     "帳號",  # 逐行註解：帳號查詢會顯示目前 Workspace 設定。
+    "settings",  # 逐行註解：英文 settings 代表查看 Workspace 設定。
+    "profile",  # 逐行註解：英文 profile 代表查看 Workspace profile。
 )  # 逐行註解：結束 Workspace 任務關鍵字。
+GOOGLE_WORKSPACE_FOLLOWUP_ACTION_KEYWORDS: tuple[str, ...] = (  # 逐行註解：辨識已進入 Workspace 模式後，哪些動作詞應被接管。
+    "列出",  # 逐行註解：中文列出代表讀取清單。
+    "讀取",  # 逐行註解：中文讀取代表讀文件或郵件內容。
+    "新增",  # 逐行註解：中文新增代表建立檔案、草稿或行程。
+    "建立",  # 逐行註解：中文建立代表建立檔案、草稿或行程。
+    "刪除",  # 逐行註解：中文刪除代表移除檔案或行程。
+    "編輯",  # 逐行註解：中文編輯代表修改檔案或內容。
+    "更新",  # 逐行註解：中文更新代表修改檔案、儲存格、表單或行程。
+    "覆蓋",  # 逐行註解：中文覆蓋代表清空原內容後重寫。
+    "清除",  # 逐行註解：中文清除代表清空試算表範圍或文件內容。
+    "改名",  # 逐行註解：中文改名代表重新命名 Drive 檔案。
+    "移動",  # 逐行註解：中文移動代表搬移 Drive 檔案。
+    "上傳",  # 逐行註解：中文上傳代表 Drive upload。
+    "下載",  # 逐行註解：中文下載代表 Drive download。
+    "撰寫",  # 逐行註解：中文撰寫代表建立 Gmail 草稿。
+    "寄信",  # 逐行註解：中文寄信代表 Gmail send。
+    "回覆",  # 逐行註解：中文回覆代表 Gmail 或 Calendar invitation response。
+    "封存",  # 逐行註解：中文封存代表 Gmail archive。
+    "標籤",  # 逐行註解：中文標籤代表 Gmail label。
+    "追加",  # 逐行註解：中文追加代表 Docs 或 Sheets append。
+    "搜尋",  # 逐行註解：中文搜尋代表搜尋 Drive、Gmail 或 Calendar。
+    "查看",  # 逐行註解：中文查看代表列出或讀取資料。
+    "list",  # 逐行註解：英文 list 代表列出清單。
+    "show",  # 逐行註解：英文 show 代表顯示清單或設定。
+    "read",  # 逐行註解：英文 read 代表讀取內容。
+    "open",  # 逐行註解：英文 open 代表打開或讀取檔案摘要。
+    "create",  # 逐行註解：英文 create 代表新增檔案、草稿或行程。
+    "add",  # 逐行註解：英文 add 代表新增檔案、草稿或行程。
+    "new",  # 逐行註解：英文 new 代表新建檔案、草稿或行程。
+    "delete",  # 逐行註解：英文 delete 代表刪除。
+    "remove",  # 逐行註解：英文 remove 代表移除。
+    "cancel",  # 逐行註解：英文 cancel 代表取消或刪除行程。
+    "edit",  # 逐行註解：英文 edit 代表編輯。
+    "update",  # 逐行註解：英文 update 代表修改。
+    "clear",  # 逐行註解：英文 clear 代表清除內容。
+    "rename",  # 逐行註解：英文 rename 代表改名。
+    "move",  # 逐行註解：英文 move 代表搬移 Drive 檔案。
+    "upload",  # 逐行註解：英文 upload 代表 Drive 上傳。
+    "download",  # 逐行註解：英文 download 代表 Drive 下載。
+    "append",  # 逐行註解：英文 append 代表追加文字到文件。
+    "compose",  # 逐行註解：英文 compose 代表撰寫 Gmail 草稿。
+    "draft",  # 逐行註解：英文 draft 代表 Gmail 草稿。
+    "send",  # 逐行註解：英文 send 代表 Gmail 寄出。
+    "reply",  # 逐行註解：英文 reply 代表 Gmail 回覆或 Calendar 回覆邀請。
+    "archive",  # 逐行註解：英文 archive 代表 Gmail 封存。
+    "label",  # 逐行註解：英文 label 代表 Gmail 標籤。
+    "search",  # 逐行註解：英文 search 代表搜尋檔案、郵件或行程。
+    "settings",  # 逐行註解：英文 settings 代表查看設定。
+    "profile",  # 逐行註解：英文 profile 代表查看設定。
+)  # 逐行註解：結束 Workspace 後續動作詞清單。
+GOOGLE_WORKSPACE_ACCOUNT_CONTEXT_KEYWORDS: tuple[str, ...] = (  # 逐行註解：辨識 Email 是否是在說 Google 帳號本身，而不是 Gmail 收件人。
+    "帳號",  # 逐行註解：中文帳號代表使用者想指定或查看 Google 帳號。
+    "帳戶",  # 逐行註解：中文帳戶也代表帳號語境。
+    "使用帳號",  # 逐行註解：明確指定使用哪個帳號時要啟動隔離檢查。
+    "切換帳號",  # 逐行註解：切換帳號不能在任務文字裡自動完成。
+    "目前帳號",  # 逐行註解：目前帳號屬於 profile 查詢語境。
+    "google account",  # 逐行註解：英文 Google account 明確指帳號。
+    "account",  # 逐行註解：英文 account 明確指帳號。
+    "profile",  # 逐行註解：英文 profile 通常是在看目前 Workspace 設定。
+    "settings",  # 逐行註解：英文 settings 通常是在看目前 Workspace 設定。
+)  # 逐行註解：結束帳號語境關鍵字清單。
 
 
 def get_user_memory(user_id: int) -> list[dict]:  # 逐行註解：安全讀取指定使用者自己的 memories JSON。
@@ -4888,11 +5001,19 @@ def validate_google_account_email(email: str) -> str:  # 逐行註解：基本�
     return cleaned  # 逐行註解：回傳整理後的 Email。
 
 
+def google_workspace_discord_user_is_allowed(user) -> bool:  # 逐行註解：確認 Discord 使用者是否具有 SUPER_USER 權限。
+    return require_super_user(user)  # 逐行註解：Google Workspace 只看 Discord SUPER_USERS，不限制綁定哪個 Google 帳號。
+
+
+def google_workspace_permission_message() -> str:  # 逐行註解：集中管理 /google_workspace 專用拒絕訊息。
+    return GOOGLE_WORKSPACE_SUPER_PERMISSION_MESSAGE  # 逐行註解：依使用者指定回覆 not Super user。
+
+
 def save_google_workspace_profile(user_id: int, google_account: str | None = None, last_tool: str | None = None) -> dict:  # 逐行註解：更新該使用者自己的 Google Workspace 設定。
     memories = get_user_memory(user_id)  # 逐行註解：讀取該使用者自己的 memories JSON。
     profile = get_google_workspace_profile(user_id)  # 逐行註解：先取得現有 Google Workspace 設定。
     if google_account is not None:  # 逐行註解：呼叫端有傳帳號時才更新帳號。
-        profile["google_account"] = validate_google_account_email(google_account)  # 逐行註解：驗證後保存 Google 帳號。
+        profile["google_account"] = validate_google_account_email(google_account)  # 逐行註解：SUPER_USER 可以綁定任意合法 Google 帳號。
     if last_tool is not None:  # 逐行註解：呼叫端有傳工具時才更新工具。
         profile["last_tool"] = str(last_tool or "").strip()  # 逐行註解：保存最後選擇的工具 value。
     target_item = None  # 逐行註解：先準備要更新的記憶項目。
@@ -4982,10 +5103,28 @@ def authorize_google_workspace_account(user_id: int, google_account: str) -> Pat
     if not client_secret_path.is_file():  # 逐行註解：沒有 client secret 就無法啟動授權。
         raise RuntimeError(f"缺少 Google OAuth client secret：請把 Desktop OAuth JSON 放到 {client_secret_path}，或設定 {GOOGLE_WORKSPACE_CLIENT_SECRET_ENV}。")  # 逐行註解：回覆明確設定方式。
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), scopes=list(GOOGLE_WORKSPACE_SCOPES))  # 逐行註解：建立 Google OAuth 本機瀏覽器授權流程。
-    credentials = flow.run_local_server(port=0, open_browser=True)  # 逐行註解：開本機瀏覽器讓使用者登入並授權。
+    credentials = flow.run_local_server(  # 逐行註解：開本機瀏覽器讓使用者登入並授權。
+        port=0,  # 逐行註解：使用可用本機埠，避免和其他服務衝突。
+        open_browser=True,  # 逐行註解：自動打開瀏覽器 OAuth 頁面。
+        timeout_seconds=GOOGLE_WORKSPACE_OAUTH_TIMEOUT_SECONDS,  # 逐行註解：逾時後丟出錯誤，避免 Discord interaction 無限等待。
+        login_hint=google_account,  # 逐行註解：提示 Google 預設使用目前 /google_workspace 記住的帳號。
+    )  # 逐行註解：完成 OAuth flow 並取得憑證。
     token_path = google_workspace_token_path(user_id, google_account)  # 逐行註解：取得該使用者自己的 token 儲存路徑。
     token_path.write_text(credentials.to_json(), encoding="utf-8")  # 逐行註解：把 OAuth token 寫進該使用者自己的 token 檔。
     return token_path  # 逐行註解：回傳 token 檔路徑供 callback 回報。
+
+
+def google_workspace_oauth_error_text(exc: Exception) -> str:  # 逐行註解：把 OAuth 例外整理成 Discord 可理解的安全文字。
+    error_name = type(exc).__name__  # 逐行註解：取得例外類型名稱，避免直接顯示完整 traceback。
+    error_message = str(exc).strip()  # 逐行註解：取得簡短錯誤文字，後續會截斷避免訊息過長。
+    lowered_message = error_message.lower()  # 逐行註解：建立小寫文字方便判斷 Google OAuth 常見錯誤。
+    if error_name == "WSGITimeoutError":  # 逐行註解：Google OAuth 頁面未完成登入或被 403 擋住時會逾時。
+        return "Google 授權逾時：請確認瀏覽器已完成 OAuth 同意；如果看到 access_denied，請到 Google Cloud OAuth consent screen 的 Test users 加入此 Google 帳號，或把 app 發布狀態調整到可授權後再重試。"  # 逐行註解：回覆可操作修復步驟。
+    if "access_denied" in lowered_message or "not completed the google verification process" in lowered_message:  # 逐行註解：Google 明確拒絕未驗證或未加入測試者的 app。
+        return "Google 授權被拒絕：這個 OAuth app 仍在測試或未完成驗證，請先在 Google Cloud OAuth consent screen 將此 Google 帳號加入 Test users，再回 Discord 按「授權 Google」。"  # 逐行註解：避免把 Google 錯誤 JSON 直接丟給 Discord。
+    if error_message:  # 逐行註解：有一般錯誤文字時顯示截斷版本。
+        return f"Google 授權失敗：{error_name}: {error_message[:300]}"  # 逐行註解：保留錯誤類型和短訊息，避免洩漏完整 URL 或 JSON。
+    return f"Google 授權失敗：{error_name}"  # 逐行註解：沒有錯誤文字時仍回覆類型名稱。
 
 
 def google_workspace_build_service(user_id: int, google_account: str, service_name: str, version: str):  # 逐行註解：建立指定 Google API service。
@@ -5006,20 +5145,30 @@ def google_workspace_text_mentions(text: str, keywords: tuple[str, ...] | list[s
     return any(keyword.lower() in lowered for keyword in keywords)  # 逐行註解：任一關鍵字命中就回傳 True。
 
 
+def google_workspace_email_should_match_account(tool: str, text: str) -> bool:  # 逐行註解：判斷文字中的 Email 是否應該拿來比對 Google 帳號。
+    if tool in {"google_gmail", "google_contacts"} and not google_workspace_text_mentions(text, GOOGLE_WORKSPACE_ACCOUNT_CONTEXT_KEYWORDS):  # 逐行註解：Gmail 與 Contacts 任務裡的 Email 通常是收件者、寄件人、搜尋條件或聯絡人資料。
+        return False  # 逐行註解：沒有帳號語境時不做帳號隔離，避免擋掉撰寫郵件。
+    return True  # 逐行註解：非 Gmail 工具或明確提到帳號時仍要保護帳號隔離。
+
+
 def google_workspace_detect_tool_from_text(profile: dict, text: str) -> str:  # 逐行註解：依 Auto 模式或文字內容判斷要使用的 Workspace 工具。
     lowered = (text or "").lower()  # 逐行註解：先轉小寫方便英文判斷。
-    if google_workspace_text_mentions(lowered, ("行事曆", "日曆", "行程", "calendar", "event", "events")):  # 逐行註解：行程相關文字優先判斷為 Calendar。
+    if google_workspace_text_mentions(lowered, ("行事曆", "日曆", "行程", "會議", "邀請", "calendar", "event", "events", "meeting", "invitation")):  # 逐行註解：行程與會議相關文字優先判斷為 Calendar。
         return "google_calendar"  # 逐行註解：回傳 Google Calendar 工具。
     if google_workspace_text_mentions(lowered, ("簡報", "投影片", "slides", "presentation", "presentations")):  # 逐行註解：簡報相關文字判斷為 Slides。
         return "google_slide"  # 逐行註解：回傳 Google Slides 工具。
-    if google_workspace_text_mentions(lowered, ("試算表", "sheet", "sheets", "spreadsheet", "spreadsheet")):  # 逐行註解：試算表相關文字判斷為 Sheets。
+    if google_workspace_text_mentions(lowered, ("試算表", "工作表", "儲存格", "sheet", "sheets", "spreadsheet", "spreadsheets", "cell", "range")):  # 逐行註解：試算表相關文字判斷為 Sheets。
         return "google_sheet"  # 逐行註解：回傳 Google Sheets 工具。
     if google_workspace_text_mentions(lowered, ("表單", "form", "forms", "問卷", "測驗")):  # 逐行註解：表單相關文字判斷為 Forms。
         return "google_form"  # 逐行註解：回傳 Google Forms 工具。
     if google_workspace_text_mentions(lowered, ("文件", "docs", "doc", "document", "documents")):  # 逐行註解：文件相關文字判斷為 Docs。
         return "google_doc"  # 逐行註解：回傳 Google Docs 工具。
-    if google_workspace_text_mentions(lowered, ("gmail", "email", "mail", "郵件", "信件", "收信", "讀信", "撰寫信", "寫信", "寄信", "草稿")):  # 逐行註解：郵件相關文字判斷為 Gmail，但放在檔案工具後避免帳號 Email 誤判。
+    if google_workspace_text_mentions(lowered, ("聯絡人", "通訊錄", "contact", "contacts", "people")):  # 逐行註解：聯絡人相關文字判斷為 Contacts。
+        return "google_contacts"  # 逐行註解：回傳 Google Contacts 工具。
+    if google_workspace_text_mentions(lowered, ("gmail", "email", "mail", "郵件", "信件", "收信", "讀信", "撰寫信", "寫信", "寄信", "草稿", "收件者", "封存", "標籤")):  # 逐行註解：郵件相關文字判斷為 Gmail，但放在檔案工具後避免帳號 Email 誤判。
         return "google_gmail"  # 逐行註解：回傳 Gmail 工具。
+    if google_workspace_text_mentions(lowered, ("drive", "雲端硬碟", "檔案", "資料夾", "folder", "upload", "download", "move file", "rename file")):  # 逐行註解：通用檔案與資料夾操作判斷為 Drive。
+        return "google_drive"  # 逐行註解：回傳 Google Drive 工具。
     selected_tool = str(profile.get("last_tool") or "").strip()  # 逐行註解：讀取使用者上次在選單中選的工具。
     if selected_tool and selected_tool != "google_auto":  # 逐行註解：如果不是 Auto 模式且文字沒明確改工具，就沿用上次工具。
         return selected_tool  # 逐行註解：回傳上次選擇工具。
@@ -5031,23 +5180,55 @@ def google_workspace_detect_actions(text: str) -> list[str]:  # 逐行註解：�
     lowered = (text or "").lower()  # 逐行註解：先轉小寫方便英文判斷。
     if google_workspace_text_mentions(lowered, ("設定", "帳號", "目前", "現在", "狀態", "settings", "profile")):  # 逐行註解：設定查詢會顯示目前 Workspace profile。
         actions.append("settings")  # 逐行註解：加入設定查詢動作。
-    if google_workspace_text_mentions(lowered, ("列出", "有哪些", "所有", "清單", "查看", "看這週", "看本週", "看今年", "list", "show")):  # 逐行註解：列出類文字會讀取清單。
+    if google_workspace_text_mentions(lowered, ("搜尋", "查找", "找", "search", "find", "query")):  # 逐行註解：搜尋類文字會搜尋資料。
+        actions.append("search")  # 逐行註解：加入搜尋動作。
+    if google_workspace_text_mentions(lowered, ("列出", "有哪些", "所有", "清單", "查看", "看這週", "看本週", "看本月", "看今天", "看今年", "list", "show")):  # 逐行註解：列出類文字會讀取清單。
         actions.append("list")  # 逐行註解：加入列出動作。
-    if google_workspace_text_mentions(lowered, ("新增", "建立", "創建", "做一個", "做一份", "加入", "create", "add", "new")):  # 逐行註解：新增類文字會建立檔案或行程。
+    if google_workspace_text_mentions(lowered, ("新增投影片", "建立投影片", "create slide", "add slide", "new slide")):  # 逐行註解：投影片新增是 Slides 的子動作。
+        actions.append("create_slide")  # 逐行註解：加入新增投影片動作。
+    if google_workspace_text_mentions(lowered, ("刪除投影片", "delete slide", "remove slide")):  # 逐行註解：投影片刪除是 Slides 的子動作。
+        actions.append("delete_slide")  # 逐行註解：加入刪除投影片動作。
+    if google_workspace_text_mentions(lowered, ("更新投影片", "修改投影片", "update slide", "edit slide")):  # 逐行註解：投影片修改是 Slides 的子動作。
+        actions.append("update_slide")  # 逐行註解：加入修改投影片動作。
+    if google_workspace_text_mentions(lowered, ("新增", "建立", "創建", "做一個", "做一份", "加入", "create", "add", "new")):  # 逐行註解：新增類文字會建立檔案、行程或聯絡人。
         actions.append("create")  # 逐行註解：加入新增動作。
+    if google_workspace_text_mentions(lowered, ("寄信", "發信", "寄出", "send email", "send mail", "send")):  # 逐行註解：Gmail 寄出文字會直接送信。
+        actions.append("send")  # 逐行註解：加入寄出動作。
     if google_workspace_text_mentions(lowered, ("撰寫", "寫信", "草稿", "draft", "compose")):  # 逐行註解：Gmail 撰寫文字會建立草稿。
-        actions.append("create")  # 逐行註解：加入新增草稿動作。
+        actions.append("draft")  # 逐行註解：加入新增草稿動作。
+    if google_workspace_text_mentions(lowered, ("回覆", "reply", "respond")):  # 逐行註解：回覆可用於 Gmail 或 Calendar 邀請。
+        actions.append("reply")  # 逐行註解：加入回覆動作。
+    if google_workspace_text_mentions(lowered, ("封存", "archive")):  # 逐行註解：Gmail 封存文字會移除 INBOX 標籤。
+        actions.append("archive")  # 逐行註解：加入封存動作。
+    if google_workspace_text_mentions(lowered, ("標籤", "label")):  # 逐行註解：Gmail 標籤文字會套用 label。
+        actions.append("label")  # 逐行註解：加入標籤動作。
+    if "上傳" in (text or "") or re.search(r"\bupload\b", lowered):  # 逐行註解：Drive 上傳文字會上傳檔案，避免檔名 Workspace_Upload 被誤判。
+        actions.append("upload")  # 逐行註解：加入上傳動作。
+    if "下載" in (text or "") or re.search(r"\b(download|export)\b", lowered):  # 逐行註解：Drive 下載文字會下載或匯出檔案，避免檔名誤判。
+        actions.append("download")  # 逐行註解：加入下載動作。
+    if google_workspace_text_mentions(lowered, ("移動", "搬移", "move")):  # 逐行註解：Drive 移動文字會改變父資料夾。
+        actions.append("move")  # 逐行註解：加入移動動作。
+    if google_workspace_text_mentions(lowered, ("改名", "更名", "rename")):  # 逐行註解：Drive 改名文字會更新檔名。
+        actions.append("rename")  # 逐行註解：加入改名動作。
+    if google_workspace_text_mentions(lowered, ("追加", "附加", "append")):  # 逐行註解：追加文字或資料列。
+        actions.append("append")  # 逐行註解：加入追加動作。
+    if google_workspace_text_mentions(lowered, ("清除", "清空", "clear")):  # 逐行註解：清除範圍或內容。
+        actions.append("clear")  # 逐行註解：加入清除動作。
     if google_workspace_text_mentions(lowered, ("刪除", "刪掉", "移除", "取消行程", "delete", "remove", "cancel")):  # 逐行註解：刪除類文字會刪檔或刪行程。
         actions.append("delete")  # 逐行註解：加入刪除動作。
     if google_workspace_text_mentions(lowered, ("讀取", "打開", "摘要", "read", "open")):  # 逐行註解：讀取類文字會讀文件、郵件或檔案摘要，避免 Gmail 草稿的「內容是」誤判成讀取。
         actions.append("read")  # 逐行註解：加入讀取動作。
-    if google_workspace_text_mentions(lowered, ("編輯", "修改", "改名", "更名", "寫入", "append", "rename", "edit")):  # 逐行註解：編輯類文字會改名或寫入文件。
+    if google_workspace_text_mentions(lowered, ("編輯", "修改", "更新", "覆蓋", "寫入", "update", "edit", "write", "overwrite")):  # 逐行註解：編輯類文字會更新檔案或資料。
         actions.append("edit")  # 逐行註解：加入編輯動作。
-    return actions or ["list"]  # 逐行註解：沒有明確動作時預設列出相關項目。
+    unique_actions: list[str] = []  # 逐行註解：準備移除重複動作但保留順序。
+    for action in actions:  # 逐行註解：逐一整理動作。
+        if action not in unique_actions:  # 逐行註解：還沒出現過才加入。
+            unique_actions.append(action)  # 逐行註解：保存唯一動作。
+    return unique_actions or ["list"]  # 逐行註解：沒有明確動作時預設列出相關項目。
 
 
 def google_workspace_extract_file_id(text: str) -> str:  # 逐行註解：從文字或 Google URL 抽取檔案 ID。
-    url_match = re.search(r"/d/([A-Za-z0-9_-]+)", text or "")  # 逐行註解：支援 Google Drive/Docs/Slides URL 的 /d/<id>。
+    url_match = re.search(r"/d/(?:e/)?([A-Za-z0-9_-]+)", text or "")  # 逐行註解：支援 Google Drive/Docs/Slides/Forms URL 的 /d/<id> 或 /d/e/<id>。
     if url_match:  # 逐行註解：如果 URL 格式命中。
         return url_match.group(1)  # 逐行註解：回傳 URL 裡的檔案 ID。
     id_match = re.search(r"(?:id|ID|檔案ID|文件ID|簡報ID)\s*[:：]\s*([A-Za-z0-9_-]+)", text or "")  # 逐行註解：支援 id:xxx 或 檔案ID：xxx。
@@ -5055,11 +5236,23 @@ def google_workspace_extract_file_id(text: str) -> str:  # 逐行註解：從文
 
 
 def google_workspace_extract_title(text: str, default_title: str = "未命名") -> str:  # 逐行註解：從使用者文字抽取要建立或編輯的標題。
-    patterns = (r"標題\s*(?:是|為|:|：)\s*(.+?)(?=\s*(?:今天|明天|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})\s*\d{1,2}:\d{2}|[，,\n]|$)", r"名稱\s*(?:是|為|:|：)\s*(.+?)(?=\s*(?:今天|明天|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})\s*\d{1,2}:\d{2}|[，,\n]|$)", r"「([^」]+)」", r"\"([^\"]+)\"")  # 逐行註解：依常見中文、時間分隔與引號格式抽取標題。
+    field_stop = r"(?=\s*(?:內容|內文|文字|資料|問題|question|[A-Z]{1,3}\d{1,7}\s*=|今天|明天|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})|\s*[，,\n]|$)"  # 逐行註解：標題遇到內容欄位、試算表 cell、日期或標點就停止。
+    patterns = (rf"標題\s*(?:是|為|:|：)\s*(.+?){field_stop}", rf"名稱\s*(?:是|為|:|：)\s*(.+?){field_stop}", rf"(?:叫做|命名為|called|named)\s*(.+?){field_stop}", r"「([^」]+)」", r"\"([^\"]+)\"")  # 逐行註解：依常見中文、英文 called/named 與引號格式抽取標題。
     for pattern in patterns:  # 逐行註解：逐一嘗試標題格式。
         match = re.search(pattern, text or "")  # 逐行註解：用目前格式搜尋文字。
         if match and match.group(1).strip():  # 逐行註解：確認有抓到非空標題。
             return match.group(1).strip()  # 逐行註解：回傳已避開日期時間尾巴的標題。
+    compact_match = re.search(r"(?:新增|建立|創建)\s*(?:一個|一份)?\s*([^，,\n]+?)(?:簡報|投影片)(?=$|[，,\n])", text or "")  # 逐行註解：支援「新增測試簡報」或「新增一個測試簡報」這種口語格式。
+    if compact_match and compact_match.group(1).strip():  # 逐行註解：確認口語格式有抓到標題。
+        return compact_match.group(1).strip()  # 逐行註解：回傳去掉「簡報」後的標題，例如測試。
+    generic_match = re.search(r"(?:新增|建立|創建|create|new)\s*(?:一個|一份|a|an)?\s*(?:google\s*)?(?:doc(?:ument)?s?|文件|slides?|presentation|presentations|簡報|投影片|sheets?|spreadsheet|spreadsheets|試算表|forms?|表單|folder|資料夾)\s+([^，,\n]+)", text or "", re.IGNORECASE)  # 逐行註解：支援 create a spreadsheet Test 這類通用格式。
+    if generic_match and generic_match.group(1).strip():  # 逐行註解：確認通用格式有抓到標題。
+        cleaned = re.sub(r"^(?:called|named|叫做|名稱是|標題是)\s*", "", generic_match.group(1).strip(), flags=re.I)  # 逐行註解：移除殘留的命名前綴。
+        if cleaned:  # 逐行註解：整理後仍有標題。
+            return cleaned  # 逐行註解：回傳通用標題。
+    trailing_match = re.search(r"(?:新增|建立|創建|做一個|做一份)\s*(?:一個|一份)?\s*(?:google\s*)?(?:slides?|簡報|投影片)\s*[，,：:\s]+([^，,\n]+)", text or "", re.IGNORECASE)  # 逐行註解：支援「新增一個簡報，測試」或英文 slides 後面接標題。
+    if trailing_match and trailing_match.group(1).strip():  # 逐行註解：確認逗號後有抓到標題。
+        return trailing_match.group(1).strip()  # 逐行註解：回傳逗號後面的標題。
     return default_title  # 逐行註解：沒有抓到時回傳預設標題。
 
 
@@ -5417,17 +5610,64 @@ def google_workspace_get_gmail_message(user_id: int, google_account: str, messag
     return service.users().messages().get(userId="me", id=message_id, format="full").execute()  # 逐行註解：用 full 格式讀取 header 與內容。
 
 
+def google_workspace_gmail_local_search_terms(query: str) -> list[str]:  # 逐行註解：把 Gmail q 轉成可做本地 fallback 比對的關鍵字。
+    query_text = (query or "").strip()  # 逐行註解：整理查詢字串。
+    terms: list[str] = []  # 逐行註解：保存本地比對詞。
+    subject_match = re.search(r"subject:\s*\"([^\"]+)\"", query_text, flags=re.I)  # 逐行註解：優先抓 subject:"..." 的主旨文字。
+    if subject_match and subject_match.group(1).strip():  # 逐行註解：有主旨查詢時。
+        terms.append(subject_match.group(1).strip())  # 逐行註解：加入完整主旨作為比對詞。
+    cleaned = re.sub(r"subject:\s*\"[^\"]+\"", " ", query_text, flags=re.I)  # 逐行註解：移除已處理的 subject 查詢。
+    cleaned = re.sub(r"\b(?:in|newer_than|older_than|after|before):\S+", " ", cleaned, flags=re.I)  # 逐行註解：移除 Gmail 搜尋 operator。
+    cleaned = re.sub(r"\b(?:from|to|cc|bcc|label):", " ", cleaned, flags=re.I)  # 逐行註解：保留 operator 後的值作為一般文字。
+    for token in re.split(r"\s+", cleaned):  # 逐行註解：把剩餘查詢切成詞。
+        token = token.strip().strip('"')  # 逐行註解：整理引號與空白。
+        if token and token.upper() not in {"OR", "AND"}:  # 逐行註解：忽略布林操作字。
+            terms.append(token)  # 逐行註解：加入本地比對詞。
+    return terms  # 逐行註解：回傳本地搜尋詞。
+
+
+def google_workspace_gmail_message_matches(message: dict, terms: list[str]) -> bool:  # 逐行註解：判斷 Gmail message 是否符合本地 fallback 搜尋詞。
+    if not terms:  # 逐行註解：沒有搜尋詞時視為符合。
+        return True  # 逐行註解：回傳符合。
+    payload = message.get("payload", {}) if isinstance(message, dict) else {}  # 逐行註解：取得 payload。
+    headers = payload.get("headers", []) if isinstance(payload, dict) else []  # 逐行註解：取得 headers。
+    haystack = " ".join([google_workspace_gmail_header(headers, "Subject"), google_workspace_gmail_header(headers, "From"), google_workspace_gmail_header(headers, "To"), str(message.get("snippet") or ""), google_workspace_gmail_extract_body(payload, max_chars=2000)]).lower()  # 逐行註解：把可搜尋內容合成一段文字。
+    return all(term.lower() in haystack for term in terms)  # 逐行註解：所有搜尋詞都命中才算符合。
+
+
 def google_workspace_list_gmail_messages(user_id: int, google_account: str, text: str, max_results: int = 10) -> str:  # 逐行註解：列出最近或符合搜尋條件的 Gmail 郵件。
     service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
-    query = google_workspace_extract_gmail_query(text)  # 逐行註解：解析 Gmail 搜尋條件。
-    response = service.users().messages().list(userId="me", q=query or None, maxResults=max_results).execute()  # 逐行註解：呼叫 Gmail API 搜尋郵件。
-    messages = response.get("messages", []) if isinstance(response, dict) else []  # 逐行註解：取出郵件 ID 清單。
-    if not messages:  # 逐行註解：沒有郵件時。
+    direct_message_id = google_workspace_extract_gmail_message_id(text)  # 逐行註解：支援用 Message ID 直接列出單封郵件摘要。
+    if direct_message_id:  # 逐行註解：有明確 Message ID 時不依賴 Gmail 搜尋索引。
+        messages = [{"id": direct_message_id}]  # 逐行註解：建立單封郵件清單。
+        query = ""  # 逐行註解：直接 ID 查詢不需要 Gmail q。
+    else:  # 逐行註解：沒有 Message ID 時才走 Gmail q 搜尋。
+        query = google_workspace_extract_gmail_query(text)  # 逐行註解：解析 Gmail 搜尋條件。
+        response = service.users().messages().list(userId="me", q=query or None, maxResults=max_results).execute()  # 逐行註解：呼叫 Gmail API 搜尋郵件。
+        messages = response.get("messages", []) if isinstance(response, dict) else []  # 逐行註解：取出郵件 ID 清單。
+    detailed_messages: list[dict] = []  # 逐行註解：保存已讀取的完整郵件。
+    for message_item in messages:  # 逐行註解：先讀取 Gmail q 直接命中的郵件。
+        message_id = str(message_item.get("id") or "").strip()  # 逐行註解：取得 message id。
+        if message_id:  # 逐行註解：有 ID 才讀取。
+            detailed_messages.append(google_workspace_get_gmail_message(user_id, google_account, message_id))  # 逐行註解：讀取完整 message metadata。
+    if not detailed_messages and query:  # 逐行註解：Gmail q 對剛寄出的信可能有索引延遲，回空時做本地 fallback。
+        fallback = service.users().messages().list(userId="me", maxResults=50, includeSpamTrash=True).execute()  # 逐行註解：抓最近 50 封含封存與垃圾桶的郵件。
+        fallback_messages = fallback.get("messages", []) if isinstance(fallback, dict) else []  # 逐行註解：取得 fallback message IDs。
+        terms = google_workspace_gmail_local_search_terms(query)  # 逐行註解：建立本地搜尋詞。
+        for message_item in fallback_messages:  # 逐行註解：逐封做本地比對。
+            message_id = str(message_item.get("id") or "").strip()  # 逐行註解：取得 message id。
+            if not message_id:  # 逐行註解：沒有 ID 就跳過。
+                continue  # 逐行註解：處理下一封。
+            message = google_workspace_get_gmail_message(user_id, google_account, message_id)  # 逐行註解：讀取完整郵件。
+            if google_workspace_gmail_message_matches(message, terms):  # 逐行註解：本地比對命中時。
+                detailed_messages.append(message)  # 逐行註解：加入搜尋結果。
+            if len(detailed_messages) >= max_results:  # 逐行註解：達到回傳上限時停止。
+                break  # 逐行註解：停止 fallback 搜尋。
+    if not detailed_messages:  # 逐行註解：沒有郵件時。
         return f"{google_account} 的 Gmail：沒有找到符合條件的郵件。"  # 逐行註解：回傳空結果。
     lines = [f"{google_account} 的 Gmail 郵件清單："]  # 逐行註解：建立回覆標題。
-    for index, message_item in enumerate(messages, start=1):  # 逐行註解：逐封讀取摘要。
-        message_id = str(message_item.get("id") or "").strip()  # 逐行註解：取得 message id。
-        message = google_workspace_get_gmail_message(user_id, google_account, message_id)  # 逐行註解：讀取完整 message metadata。
+    for index, message in enumerate(detailed_messages, start=1):  # 逐行註解：逐封整理摘要。
+        message_id = str(message.get("id") or "").strip()  # 逐行註解：取得 message id。
         payload = message.get("payload", {}) if isinstance(message, dict) else {}  # 逐行註解：取得 Gmail payload。
         headers = payload.get("headers", []) if isinstance(payload, dict) else []  # 逐行註解：取得 headers。
         subject = google_workspace_gmail_header(headers, "Subject") or "無主旨"  # 逐行註解：取得信件主旨。
@@ -5484,6 +5724,740 @@ def google_workspace_create_gmail_draft(user_id: int, google_account: str, text:
     return f"已建立 Gmail 草稿，但尚未寄出。\n收件者：{recipient}\n主旨：{subject}\nDraft ID：{draft_id}"  # 逐行註解：回傳草稿建立結果。
 
 
+def google_workspace_extract_named_value(text: str, names: tuple[str, ...]) -> str:  # 逐行註解：從文字抽取指定欄位值。
+    joined_names = "|".join(re.escape(name) for name in names)  # 逐行註解：把多個欄位名稱組成 regex。
+    match = re.search(rf"(?:{joined_names})\s*(?:是|為|:|：)?\s*(.+?)(?=\s*(?:收件者|主旨|內容|內文|標題|名稱|email|phone|電話|路徑|資料夾|range|範圍)\s*(?:是|為|:|：)|[，,\n]|$)", text or "", flags=re.I | re.S)  # 逐行註解：抓到下一個欄位或句尾前的內容。
+    return match.group(1).strip() if match and match.group(1).strip() else ""  # 逐行註解：回傳欄位值或空字串。
+
+
+def google_workspace_extract_content_text(text: str, default: str = "") -> str:  # 逐行註解：抽取要寫入文件、投影片、試算表或表單的內容。
+    match = re.search(r"(?:內容|內文|文字|資料|rows?|values?|問題|question)\s*(?:是|為|:|：)?\s*(.+)", text or "", flags=re.I | re.S)  # 逐行註解：支援常見內容欄位。
+    if match and match.group(1).strip():  # 逐行註解：如果有明確內容。
+        return match.group(1).strip()  # 逐行註解：回傳內容。
+    return default  # 逐行註解：沒有內容時回傳預設值。
+
+
+def google_workspace_extract_search_query(text: str, default: str = "") -> str:  # 逐行註解：抽取搜尋關鍵字。
+    direct_match = re.search(r"(?:關鍵字|query)\s*(?:是|為|:|：)?\s*(.+?)(?=\s*(?:新姓名|新名稱|姓名|名稱|email|電話|phone|內容|內文|標題|label|標籤)\s*(?:是|為|:|：)|[，,\n]|$)", text or "", flags=re.I | re.S)  # 逐行註解：明確關鍵字欄位優先，避免「搜尋聯絡人」被當成搜尋內容。
+    if direct_match and direct_match.group(1).strip():  # 逐行註解：如果有關鍵字欄位。
+        return direct_match.group(1).strip()  # 逐行註解：回傳明確關鍵字。
+    match = re.search(r"(?:搜尋|查找|找|search|find)\s*(?:Google\s*)?(?:Drive|Docs|文件|簡報|投影片|試算表|表單|聯絡人|Contacts?|Gmail|郵件|行程|Calendar)?\s*(?:是|為|:|：)?\s*(.+?)(?=\s*(?:新姓名|新名稱|姓名|名稱|email|電話|phone|內容|內文|標題|label|標籤)\s*(?:是|為|:|：)|[，,\n]|$)", text or "", flags=re.I | re.S)  # 逐行註解：支援搜尋工具名稱後接查詢字。
+    if match and match.group(1).strip():  # 逐行註解：找到搜尋字時。
+        return match.group(1).strip()  # 逐行註解：回傳搜尋字。
+    title = google_workspace_extract_title(text, default_title="").strip()  # 逐行註解：退回使用標題欄位。
+    return title or default  # 逐行註解：回傳標題或預設值。
+
+
+def google_workspace_delete_drive_file(user_id: int, google_account: str, tool: str, text: str) -> str:  # 逐行註解：刪除 Drive 檔案或 Workspace 檔案。
+    file_item = google_workspace_find_drive_file(user_id, google_account, tool, text)  # 逐行註解：先定位要刪除的檔案。
+    if not file_item:  # 逐行註解：找不到檔案時。
+        return "請提供要刪除的檔案連結、檔案 ID，或用「標題是...」指定檔名。"  # 逐行註解：要求提供定位資訊。
+    service = google_workspace_build_service(user_id, google_account, "drive", "v3")  # 逐行註解：建立 Drive API service。
+    file_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得檔案 ID。
+    file_name = str(file_item.get("name") or "未命名").strip()  # 逐行註解：取得檔名。
+    service.files().delete(fileId=file_id).execute()  # 逐行註解：呼叫 Drive API 刪除檔案。
+    return f"已刪除檔案：{file_name}\nID：{file_id}"  # 逐行註解：回傳刪除結果。
+
+
+def google_workspace_create_document(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：建立 Google Docs 文件。
+    title = google_workspace_extract_title(text, default_title="未命名文件")  # 逐行註解：解析文件標題。
+    content = google_workspace_extract_content_text(text)  # 逐行註解：解析初始文件內容。
+    service = google_workspace_build_service(user_id, google_account, "docs", "v1")  # 逐行註解：建立 Docs API service。
+    document = service.documents().create(body={"title": title}).execute()  # 逐行註解：建立文件。
+    document_id = str(document.get("documentId") or "").strip()  # 逐行註解：取得文件 ID。
+    if content:  # 逐行註解：如果使用者同時要求寫入內容。
+        service.documents().batchUpdate(documentId=document_id, body={"requests": [{"insertText": {"location": {"index": 1}, "text": content}}]}).execute()  # 逐行註解：把內容插入文件開頭。
+    link = f"https://docs.google.com/document/d/{document_id}/edit" if document_id else "（未取得連結）"  # 逐行註解：建立文件連結。
+    return f"已建立 Google Docs 文件：{title}\nID：{document_id}\n連結：{link}"  # 逐行註解：回傳建立結果。
+
+
+def google_workspace_update_document(user_id: int, google_account: str, text: str, overwrite: bool = False) -> str:  # 逐行註解：更新或覆蓋 Google Docs 文件內容。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_doc", text)  # 逐行註解：定位目標文件。
+    if not file_item:  # 逐行註解：找不到文件時。
+        return "請提供要更新的 Google Docs 連結、文件 ID，或用「標題是...」指定文件。"  # 逐行註解：提示提供定位資訊。
+    content = google_workspace_extract_content_text(text) or google_workspace_extract_doc_append_text(text)  # 逐行註解：抽取要寫入的內容。
+    if not content:  # 逐行註解：沒有內容不能更新。
+        return "請提供要寫入文件的內容，例如：文件ID:xxx 內容是 Hello Google Docs。"  # 逐行註解：提示內容格式。
+    file_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得文件 ID。
+    service = google_workspace_build_service(user_id, google_account, "docs", "v1")  # 逐行註解：建立 Docs API service。
+    document = service.documents().get(documentId=file_id).execute()  # 逐行註解：讀取文件結構。
+    body_content = document.get("body", {}).get("content", []) if isinstance(document, dict) else []  # 逐行註解：取得 body content。
+    end_index = max([int(item.get("endIndex", 1)) for item in body_content if isinstance(item, dict) and item.get("endIndex")] or [1])  # 逐行註解：取得文件結尾 index。
+    requests_body: list[dict] = []  # 逐行註解：準備 Docs batchUpdate requests。
+    if overwrite or google_workspace_text_mentions(text, ("覆蓋", "清空", "overwrite")):  # 逐行註解：覆蓋模式會先刪除原內容。
+        if end_index > 2:  # 逐行註解：文件有既有內容時才刪除。
+            requests_body.append({"deleteContentRange": {"range": {"startIndex": 1, "endIndex": end_index - 1}}})  # 逐行註解：刪除文件主體內容。
+        requests_body.append({"insertText": {"location": {"index": 1}, "text": content}})  # 逐行註解：插入新內容。
+    else:  # 逐行註解：非覆蓋模式使用追加。
+        requests_body.append({"insertText": {"location": {"index": max(1, end_index - 1)}, "text": f"\n{content}"}})  # 逐行註解：追加到文件尾端。
+    service.documents().batchUpdate(documentId=file_id, body={"requests": requests_body}).execute()  # 逐行註解：執行文件更新。
+    return f"已更新 Google Docs：{file_item.get('name')}\nID：{file_id}"  # 逐行註解：回傳更新結果。
+
+
+def google_workspace_create_sheet(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：建立 Google Sheets 試算表。
+    title = google_workspace_extract_title(text, default_title="未命名試算表")  # 逐行註解：解析試算表標題。
+    service = google_workspace_build_service(user_id, google_account, "sheets", "v4")  # 逐行註解：建立 Sheets API service。
+    spreadsheet = service.spreadsheets().create(body={"properties": {"title": title}}, fields="spreadsheetId,spreadsheetUrl,properties").execute()  # 逐行註解：建立試算表。
+    spreadsheet_id = str(spreadsheet.get("spreadsheetId") or "").strip()  # 逐行註解：取得試算表 ID。
+    if re.search(r"[A-Z]+\d+\s*=", text or ""):  # 逐行註解：如果使用者同時提供 A1 = value 格式。
+        google_workspace_update_sheet_cells(user_id, google_account, f"id:{spreadsheet_id} {text}")  # 逐行註解：建立後立即寫入指定儲存格。
+    return f"已建立 Google Sheets 試算表：{title}\nID：{spreadsheet_id}\n連結：{spreadsheet.get('spreadsheetUrl')}"  # 逐行註解：回傳建立結果。
+
+
+def google_workspace_extract_sheet_range(text: str, default_range: str = "A1:Z20") -> str:  # 逐行註解：抽取 Sheets API range。
+    match = re.search(r"(?:範圍|range)\s*(?:是|為|:|：)?\s*([A-Za-z0-9_ !:$]+)", text or "", flags=re.I)  # 逐行註解：支援範圍: Sheet1!A1:B2。
+    if match and match.group(1).strip():  # 逐行註解：有明確範圍時。
+        return match.group(1).strip()  # 逐行註解：回傳指定範圍。
+    cell_match = re.search(r"\b([A-Z]{1,3}\d{1,7})\b", text or "")  # 逐行註解：支援單一儲存格。
+    if cell_match:  # 逐行註解：有單一 cell 時。
+        return cell_match.group(1)  # 逐行註解：回傳 cell。
+    return default_range  # 逐行註解：沒有指定時回傳預設範圍。
+
+
+def google_workspace_extract_sheet_cell_values(text: str) -> list[tuple[str, str]]:  # 逐行註解：解析 A1 = value 這類儲存格設定。
+    values: list[tuple[str, str]] = []  # 逐行註解：保存 cell/value pair。
+    for match in re.finditer(r"\b([A-Z]{1,3}\d{1,7})\s*=\s*(.*?)(?=\s+[A-Z]{1,3}\d{1,7}\s*=|[,\n，]|$)", text or "", flags=re.S):  # 逐行註解：逐一抓取儲存格指定值，遇到下一個 cell 或標點就停止。
+        values.append((match.group(1).strip(), match.group(2).strip()))  # 逐行註解：加入解析結果。
+    return values  # 逐行註解：回傳儲存格設定列表。
+
+
+def google_workspace_sheet_values_from_text(text: str) -> list[list[str]]:  # 逐行註解：把文字資料轉成 Sheets rows。
+    content = google_workspace_extract_content_text(text)  # 逐行註解：先抓內容欄位。
+    if not content:  # 逐行註解：沒有內容時。
+        return []  # 逐行註解：回傳空 rows。
+    rows: list[list[str]] = []  # 逐行註解：保存 rows。
+    for line in content.splitlines():  # 逐行註解：每一行是一列。
+        cleaned = line.strip()  # 逐行註解：整理空白。
+        if cleaned:  # 逐行註解：跳過空行。
+            rows.append([item.strip() for item in re.split(r"\s*,\s*|\s*\t\s*", cleaned)])  # 逐行註解：用逗號或 tab 切成欄位。
+    return rows  # 逐行註解：回傳資料列。
+
+
+def google_workspace_read_sheet(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：讀取 Google Sheets 指定範圍。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_sheet", text)  # 逐行註解：定位試算表。
+    if not file_item:  # 逐行註解：找不到試算表時。
+        return "請提供要讀取的 Google Sheets 連結、試算表 ID，或用「標題是...」指定試算表。"  # 逐行註解：提示定位格式。
+    spreadsheet_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得試算表 ID。
+    range_name = google_workspace_extract_sheet_range(text)  # 逐行註解：解析讀取範圍。
+    service = google_workspace_build_service(user_id, google_account, "sheets", "v4")  # 逐行註解：建立 Sheets API service。
+    response = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()  # 逐行註解：讀取指定範圍。
+    values = response.get("values", []) if isinstance(response, dict) else []  # 逐行註解：取得 values。
+    if not values:  # 逐行註解：沒有資料時。
+        return f"Google Sheets：{file_item.get('name')}\n範圍：{range_name}\n沒有資料。"  # 逐行註解：回傳空結果。
+    lines = [" | ".join(str(cell) for cell in row) for row in values[:30]]  # 逐行註解：格式化前 30 列。
+    return f"Google Sheets：{file_item.get('name')}\n範圍：{range_name}\n\n" + "\n".join(lines)  # 逐行註解：回傳讀取結果。
+
+
+def google_workspace_update_sheet_cells(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：更新 Google Sheets 儲存格或範圍。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_sheet", text)  # 逐行註解：定位試算表。
+    if not file_item:  # 逐行註解：找不到試算表時。
+        return "請提供要更新的 Google Sheets 連結、試算表 ID，或用「標題是...」指定試算表。"  # 逐行註解：提示定位資訊。
+    spreadsheet_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得試算表 ID。
+    service = google_workspace_build_service(user_id, google_account, "sheets", "v4")  # 逐行註解：建立 Sheets API service。
+    cell_values = google_workspace_extract_sheet_cell_values(text)  # 逐行註解：解析 A1 = value 格式。
+    if cell_values:  # 逐行註解：有單格更新時逐一寫入。
+        for cell, value in cell_values:  # 逐行註解：逐一更新儲存格。
+            service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=cell, valueInputOption="USER_ENTERED", body={"values": [[value]]}).execute()  # 逐行註解：更新單一儲存格。
+        return f"已更新 Google Sheets：{file_item.get('name')}\n更新儲存格：{', '.join(cell for cell, _ in cell_values)}"  # 逐行註解：回傳更新結果。
+    rows = google_workspace_sheet_values_from_text(text)  # 逐行註解：解析多列資料。
+    if not rows:  # 逐行註解：沒有資料時。
+        return "請提供要寫入的資料，例如：A1 = Name、A2 = Sean，或 內容是 Name,Age\\nSean,10。"  # 逐行註解：提示資料格式。
+    range_name = google_workspace_extract_sheet_range(text, "A1")  # 逐行註解：取得寫入範圍。
+    service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_name, valueInputOption="USER_ENTERED", body={"values": rows}).execute()  # 逐行註解：更新指定範圍。
+    return f"已寫入 Google Sheets：{file_item.get('name')}\n範圍：{range_name}\n列數：{len(rows)}"  # 逐行註解：回傳寫入結果。
+
+
+def google_workspace_append_sheet_rows(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：追加資料列到 Google Sheets。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_sheet", text)  # 逐行註解：定位試算表。
+    if not file_item:  # 逐行註解：找不到試算表時。
+        return "請提供要追加資料的 Google Sheets 連結、試算表 ID，或用「標題是...」指定試算表。"  # 逐行註解：提示定位資訊。
+    rows = google_workspace_sheet_values_from_text(text)  # 逐行註解：解析要追加的列。
+    if not rows:  # 逐行註解：沒有 rows 時。
+        return "請提供要追加的資料列，例如：內容是 Sean,10。"  # 逐行註解：提示 rows 格式。
+    spreadsheet_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得試算表 ID。
+    range_name = google_workspace_extract_sheet_range(text, "A1")  # 逐行註解：取得 append 起始範圍。
+    service = google_workspace_build_service(user_id, google_account, "sheets", "v4")  # 逐行註解：建立 Sheets API service。
+    service.spreadsheets().values().append(spreadsheetId=spreadsheet_id, range=range_name, valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS", body={"values": rows}).execute()  # 逐行註解：追加 rows。
+    return f"已追加 Google Sheets 資料列：{file_item.get('name')}\n列數：{len(rows)}"  # 逐行註解：回傳 append 結果。
+
+
+def google_workspace_clear_sheet_range(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：清除 Google Sheets 指定範圍。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_sheet", text)  # 逐行註解：定位試算表。
+    if not file_item:  # 逐行註解：找不到試算表時。
+        return "請提供要清除的 Google Sheets 連結、試算表 ID，或用「標題是...」指定試算表。"  # 逐行註解：提示定位資訊。
+    spreadsheet_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得試算表 ID。
+    range_name = google_workspace_extract_sheet_range(text, "A1:Z1000")  # 逐行註解：取得清除範圍。
+    service = google_workspace_build_service(user_id, google_account, "sheets", "v4")  # 逐行註解：建立 Sheets API service。
+    service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=range_name, body={}).execute()  # 逐行註解：清除指定範圍。
+    return f"已清除 Google Sheets：{file_item.get('name')}\n範圍：{range_name}"  # 逐行註解：回傳清除結果。
+
+
+def google_workspace_add_sheet_tab(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：新增 Google Sheets 工作表分頁。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_sheet", text)  # 逐行註解：定位試算表。
+    if not file_item:  # 逐行註解：找不到試算表時。
+        return "請提供要新增工作表的 Google Sheets 連結、試算表 ID，或用「標題是...」指定試算表。"  # 逐行註解：提示定位資訊。
+    tab_name = google_workspace_extract_named_value(text, ("工作表", "分頁", "sheet name", "tab")) or google_workspace_extract_title(text, default_title="New Sheet")  # 逐行註解：解析工作表名稱。
+    service = google_workspace_build_service(user_id, google_account, "sheets", "v4")  # 逐行註解：建立 Sheets API service。
+    response = service.spreadsheets().batchUpdate(spreadsheetId=str(file_item.get("id")), body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}).execute()  # 逐行註解：新增工作表分頁。
+    sheet_id = str(((response.get("replies") or [{}])[0].get("addSheet") or {}).get("properties", {}).get("sheetId") or "")  # 逐行註解：取得新分頁 ID。
+    return f"已新增工作表分頁：{tab_name}\nSheet ID：{sheet_id}"  # 逐行註解：回傳新增結果。
+
+
+def google_workspace_create_drive_folder(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：建立 Google Drive 資料夾。
+    title = google_workspace_extract_title(text, default_title="未命名資料夾")  # 逐行註解：解析資料夾名稱。
+    service = google_workspace_build_service(user_id, google_account, "drive", "v3")  # 逐行註解：建立 Drive API service。
+    folder = service.files().create(body={"name": title, "mimeType": "application/vnd.google-apps.folder"}, fields="id,name,webViewLink").execute()  # 逐行註解：建立 Drive 資料夾。
+    return f"已建立 Google Drive 資料夾：{folder.get('name')}\nID：{folder.get('id')}\n連結：{folder.get('webViewLink')}"  # 逐行註解：回傳建立結果。
+
+
+def google_workspace_extract_local_path(text: str) -> str:  # 逐行註解：從文字抽取本機檔案路徑。
+    path_match = re.search(r"(?:路徑|檔案|file|path)\s*(?:是|為|:|：)?\s*([~/].+?)(?=\s+(?:標題|名稱|title|name)\s*(?:是|為|:|：)|[，,\n]|$)", text or "", flags=re.I)  # 逐行註解：支援 path:/Users/... 或 ~/...，遇到標題欄位就停止。
+    if path_match:  # 逐行註解：如果有路徑欄位。
+        return str(Path(path_match.group(1).strip()).expanduser())  # 逐行註解：回傳展開後路徑。
+    quoted_match = re.search(r"['\"]([~/][^'\"]+)['\"]", text or "")  # 逐行註解：支援引號包起來的路徑。
+    if quoted_match:  # 逐行註解：如果有引號路徑。
+        return str(Path(quoted_match.group(1).strip()).expanduser())  # 逐行註解：回傳展開後路徑。
+    return ""  # 逐行註解：找不到路徑時回傳空字串。
+
+
+def google_workspace_upload_drive_file(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：上傳本機檔案到 Google Drive。
+    local_path = google_workspace_extract_local_path(text)  # 逐行註解：解析本機路徑。
+    if not local_path or not Path(local_path).is_file():  # 逐行註解：檔案不存在時。
+        return "請提供存在的本機檔案路徑，例如：上傳 路徑是 /Users/seannb/Desktop/test.txt。"  # 逐行註解：提示路徑格式。
+    from googleapiclient.http import MediaFileUpload  # 逐行註解：需要上傳時才載入 Google API 上傳類別。
+    service = google_workspace_build_service(user_id, google_account, "drive", "v3")  # 逐行註解：建立 Drive API service。
+    file_path = Path(local_path)  # 逐行註解：轉成 Path 方便取檔名。
+    upload_name = google_workspace_extract_title(text, default_title=file_path.name)  # 逐行註解：允許指定上傳後檔名。
+    mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"  # 逐行註解：推測檔案 MIME type。
+    media = MediaFileUpload(str(file_path), mimetype=mime_type, resumable=False)  # 逐行註解：建立上傳 media。
+    file_body: dict[str, object] = {"name": upload_name}  # 逐行註解：建立 Drive file metadata。
+    uploaded = service.files().create(body=file_body, media_body=media, fields="id,name,webViewLink,mimeType").execute()  # 逐行註解：上傳檔案。
+    return f"已上傳到 Google Drive：{uploaded.get('name')}\nID：{uploaded.get('id')}\n連結：{uploaded.get('webViewLink')}"  # 逐行註解：回傳上傳結果。
+
+
+def google_workspace_download_drive_file(user_id: int, google_account: str, tool: str, text: str) -> str:  # 逐行註解：下載或匯出 Google Drive 檔案。
+    from googleapiclient.http import MediaIoBaseDownload  # 逐行註解：需要下載時才載入 Google API 下載類別。
+    file_item = google_workspace_find_drive_file(user_id, google_account, tool, text)  # 逐行註解：定位要下載的檔案。
+    if not file_item:  # 逐行註解：找不到檔案時。
+        return "請提供要下載的檔案連結、檔案 ID，或用「標題是...」指定檔名。"  # 逐行註解：提示定位資訊。
+    service = google_workspace_build_service(user_id, google_account, "drive", "v3")  # 逐行註解：建立 Drive API service。
+    file_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得檔案 ID。
+    file_name = re.sub(r"[/:\\]", "_", str(file_item.get("name") or file_id).strip())  # 逐行註解：整理本機安全檔名。
+    mime_type = str(file_item.get("mimeType") or "").strip()  # 逐行註解：取得 MIME type。
+    export_map = {GOOGLE_WORKSPACE_MIME_TYPES["google_doc"]: ("text/plain", ".txt"), GOOGLE_WORKSPACE_MIME_TYPES["google_slide"]: ("application/pdf", ".pdf"), GOOGLE_WORKSPACE_MIME_TYPES["google_sheet"]: ("text/csv", ".csv"), GOOGLE_WORKSPACE_MIME_TYPES["google_form"]: ("application/zip", ".zip")}  # 逐行註解：Google 原生檔需用 export media。
+    if mime_type in export_map:  # 逐行註解：Google 原生檔案走 export。
+        export_mime, suffix = export_map[mime_type]  # 逐行註解：取得匯出格式。
+        request = service.files().export_media(fileId=file_id, mimeType=export_mime)  # 逐行註解：建立 export request。
+        output_name = f"{file_name}{suffix}" if not file_name.endswith(suffix) else file_name  # 逐行註解：確保副檔名正確。
+    else:  # 逐行註解：一般檔案可直接下載。
+        request = service.files().get_media(fileId=file_id)  # 逐行註解：建立 download request。
+        output_name = file_name  # 逐行註解：一般檔案保留原檔名。
+    output_dir = BOT_DIR / "google_downloads"  # 逐行註解：下載檔案集中放專案 google_downloads。
+    output_dir.mkdir(parents=True, exist_ok=True)  # 逐行註解：確保下載資料夾存在。
+    output_path = output_dir / output_name  # 逐行註解：建立輸出路徑。
+    buffer = io.BytesIO()  # 逐行註解：先用記憶體接收下載資料。
+    downloader = MediaIoBaseDownload(buffer, request)  # 逐行註解：建立下載器。
+    done = False  # 逐行註解：標記下載狀態。
+    while not done:  # 逐行註解：分段下載直到完成。
+        _status, done = downloader.next_chunk()  # 逐行註解：下載下一段。
+    output_path.write_bytes(buffer.getvalue())  # 逐行註解：把下載內容寫到本機檔案。
+    return f"已下載 Google Drive 檔案：{file_item.get('name')}\n本機路徑：{output_path}\nID：{file_id}"  # 逐行註解：回傳下載結果。
+
+
+def google_workspace_move_drive_file(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：移動 Drive 檔案到指定資料夾。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_drive", text)  # 逐行註解：定位要移動的檔案。
+    if not file_item:  # 逐行註解：找不到檔案時。
+        return "請提供要移動的檔案連結、檔案 ID，或用「標題是...」指定檔名。"  # 逐行註解：提示定位資訊。
+    folder_id = google_workspace_extract_named_value(text, ("資料夾ID", "folder id", "目標資料夾ID"))  # 逐行註解：解析目標資料夾 ID。
+    if not folder_id:  # 逐行註解：沒有目標 ID 時。
+        return "請提供目標資料夾 ID，例如：移動 檔案ID:xxx 資料夾ID:yyy。"  # 逐行註解：提示必要欄位。
+    service = google_workspace_build_service(user_id, google_account, "drive", "v3")  # 逐行註解：建立 Drive API service。
+    file_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得檔案 ID。
+    current = service.files().get(fileId=file_id, fields="parents").execute()  # 逐行註解：讀取目前父資料夾。
+    previous_parents = ",".join(current.get("parents", []) or [])  # 逐行註解：Drive API update 需要 removeParents。
+    moved = service.files().update(fileId=file_id, addParents=folder_id, removeParents=previous_parents, fields="id,name,parents,webViewLink").execute()  # 逐行註解：移動檔案。
+    return f"已移動 Google Drive 檔案：{moved.get('name')}\nID：{moved.get('id')}\n連結：{moved.get('webViewLink')}"  # 逐行註解：回傳移動結果。
+
+
+def google_workspace_build_gmail_raw_message(sender: str, recipient: str, subject: str, body: str, headers: dict[str, str] | None = None) -> str:  # 逐行註解：建立 Gmail API raw message。
+    message = EmailMessage()  # 逐行註解：使用標準庫建立 RFC 2822 郵件。
+    message["To"] = recipient  # 逐行註解：設定收件者。
+    message["From"] = sender  # 逐行註解：設定寄件者。
+    message["Subject"] = subject or "無主旨"  # 逐行註解：設定主旨。
+    for header_name, header_value in (headers or {}).items():  # 逐行註解：加入回覆信需要的額外 header。
+        if header_value:  # 逐行註解：有值才加入。
+            message[header_name] = header_value  # 逐行註解：設定 header。
+    message.set_content(body or "")  # 逐行註解：設定純文字內容。
+    return base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")  # 逐行註解：Gmail API 需要 base64url raw。
+
+
+def google_workspace_extract_recipient_name(text: str) -> str:  # 逐行註解：抽取 Gmail 收件人姓名或關鍵字。
+    match = re.search(r"(?:寄給|收件者|to)\s*(?:是|為|:|：)?\s*([^，,\n]+)", text or "", flags=re.I)  # 逐行註解：支援寄給 Sean 或 to Sean。
+    if match and match.group(1).strip():  # 逐行註解：有指定收件人。
+        value = match.group(1).strip()  # 逐行註解：整理收件人。
+        if "@" not in value:  # 逐行註解：不是 email 時作為 Contacts 搜尋字。
+            return value  # 逐行註解：回傳姓名。
+    return ""  # 逐行註解：沒有姓名時回傳空字串。
+
+
+def google_workspace_resolve_gmail_recipient(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：解析 Gmail 收件者，支援 Email 或 Contacts 姓名。
+    recipient = google_workspace_extract_email(text)  # 逐行註解：先取文字中的 Email。
+    if recipient:  # 逐行註解：有 Email 時直接使用。
+        return recipient  # 逐行註解：回傳 Email。
+    contact_name = google_workspace_extract_recipient_name(text)  # 逐行註解：嘗試抽取聯絡人姓名。
+    if not contact_name:  # 逐行註解：沒有姓名時。
+        return ""  # 逐行註解：無法解析收件者。
+    try:  # 逐行註解：Contacts API 可能沒有授權或查不到。
+        person = google_workspace_find_contact(user_id, google_account, contact_name)  # 逐行註解：用 Contacts 搜尋收件人。
+    except Exception:  # 逐行註解：Contacts 查詢失敗時不要讓 Gmail 任務直接崩潰。
+        person = None  # 逐行註解：視為未找到。
+    emails = (person or {}).get("emailAddresses", []) if isinstance(person, dict) else []  # 逐行註解：取得聯絡人 email 清單。
+    return str((emails[0] if emails else {}).get("value") or "").strip()  # 逐行註解：回傳第一個 email。
+
+
+def google_workspace_extract_gmail_draft_fields(text: str) -> tuple[str, str, str]:  # 逐行註解：從使用者文字抽取 Gmail 收件者、主旨與內容。
+    to_match = re.search(r"(?:收件者|寄給|to)\s*(?:是|為|:|：)?\s*([A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", text or "", flags=re.I)  # 逐行註解：抽取收件者 Email。
+    subject_match = re.search(r"(?:主旨|subject)\s*(?:是|為|:|：)\s*(.+?)(?=\s*(?:內容|內文|body)\s*(?:是|為|:|：)|[，,\n]|$)", text or "", flags=re.I)  # 逐行註解：抽取信件主旨。
+    body_match = re.search(r"(?:內容|內文|body)\s*(?:是|為|:|：)\s*(.+)", text or "", flags=re.I | re.S)  # 逐行註解：抽取信件內容。
+    recipient = to_match.group(1).strip() if to_match else google_workspace_extract_email(text)  # 逐行註解：先抓 Email。
+    subject = subject_match.group(1).strip() if subject_match else google_workspace_extract_title(text, default_title="無主旨")  # 逐行註解：解析主旨。
+    body = body_match.group(1).strip() if body_match else google_workspace_extract_content_text(text)  # 逐行註解：解析內文。
+    return recipient, subject, body  # 逐行註解：回傳欄位。
+
+
+def google_workspace_create_gmail_draft(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：建立 Gmail 草稿但不直接寄出。
+    recipient, subject, body = google_workspace_extract_gmail_draft_fields(text)  # 逐行註解：解析草稿欄位。
+    recipient = recipient or google_workspace_resolve_gmail_recipient(user_id, google_account, text)  # 逐行註解：沒有 Email 時嘗試用 Contacts 解析姓名。
+    if not recipient or "@" not in recipient:  # 逐行註解：收件者必須有效。
+        return "請提供收件者 Email，或先在 Google Contacts 建立可搜尋的聯絡人，例如：寄給 Sean 主旨是問候 內容是你好。"  # 逐行註解：提示收件人格式。
+    if not body:  # 逐行註解：沒有內文時不建立空草稿。
+        return "請提供 Gmail 草稿內容，例如：內容是這是我要寄出的文字。"  # 逐行註解：提示內文格式。
+    service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
+    encoded = google_workspace_build_gmail_raw_message(google_account, recipient, subject, body)  # 逐行註解：建立 Gmail raw message。
+    draft = service.users().drafts().create(userId="me", body={"message": {"raw": encoded}}).execute()  # 逐行註解：建立草稿。
+    return f"已建立 Gmail 草稿，但尚未寄出。\n收件者：{recipient}\n主旨：{subject}\nDraft ID：{draft.get('id')}"  # 逐行註解：回傳草稿結果。
+
+
+def google_workspace_send_gmail_email(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：寄出 Gmail 郵件。
+    recipient, subject, body = google_workspace_extract_gmail_draft_fields(text)  # 逐行註解：解析郵件欄位。
+    recipient = recipient or google_workspace_resolve_gmail_recipient(user_id, google_account, text)  # 逐行註解：支援 Contacts 姓名解析。
+    if not recipient or "@" not in recipient:  # 逐行註解：收件者必須有效。
+        return "請提供收件者 Email，或先建立可搜尋到 Email 的 Google Contacts 聯絡人。"  # 逐行註解：提示收件人格式。
+    if not body:  # 逐行註解：沒有內文時不寄出。
+        return "請提供要寄出的內容，例如：寄信給 someone@example.com 主旨是測試 內容是 Hello。"  # 逐行註解：提示內文格式。
+    service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
+    encoded = google_workspace_build_gmail_raw_message(google_account, recipient, subject, body)  # 逐行註解：建立 raw message。
+    sent = service.users().messages().send(userId="me", body={"raw": encoded}).execute()  # 逐行註解：寄出郵件。
+    return f"已寄出 Gmail。\n收件者：{recipient}\n主旨：{subject}\nMessage ID：{sent.get('id')}"  # 逐行註解：回傳寄信結果。
+
+
+def google_workspace_extract_gmail_message_id(text: str) -> str:  # 逐行註解：從文字抽取 Gmail message ID。
+    match = re.search(r"(?:Message ID|message id|郵件ID|信件ID|id)\s*[:：]\s*([A-Za-z0-9_-]+)", text or "", flags=re.I)  # 逐行註解：支援 Message ID:xxx。
+    return match.group(1).strip() if match else ""  # 逐行註解：回傳 ID 或空字串。
+
+
+def google_workspace_find_gmail_message(user_id: int, google_account: str, text: str) -> dict | None:  # 逐行註解：依 message ID 或搜尋條件找 Gmail 郵件。
+    service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
+    message_id = google_workspace_extract_gmail_message_id(text)  # 逐行註解：先找明確 ID。
+    if message_id:  # 逐行註解：有 ID 時直接讀取。
+        return service.users().messages().get(userId="me", id=message_id, format="full").execute()  # 逐行註解：回傳完整 message。
+    query = google_workspace_extract_gmail_query(text) or google_workspace_extract_search_query(text)  # 逐行註解：解析 Gmail 搜尋 query。
+    response = service.users().messages().list(userId="me", q=query, maxResults=1).execute()  # 逐行註解：搜尋第一封符合郵件。
+    messages = response.get("messages", []) if isinstance(response, dict) else []  # 逐行註解：取得搜尋結果。
+    if not messages:  # 逐行註解：沒有搜尋結果。
+        return None  # 逐行註解：回傳 None。
+    return service.users().messages().get(userId="me", id=messages[0]["id"], format="full").execute()  # 逐行註解：讀取第一封完整內容。
+
+
+def google_workspace_reply_gmail_message(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：回覆 Gmail 郵件。
+    original = google_workspace_find_gmail_message(user_id, google_account, text)  # 逐行註解：定位要回覆的郵件。
+    if not original:  # 逐行註解：找不到郵件時。
+        return "請提供要回覆的 Gmail Message ID，或用關鍵字搜尋到唯一郵件。"  # 逐行註解：提示定位資訊。
+    body = google_workspace_extract_content_text(text)  # 逐行註解：解析回覆內容。
+    if not body:  # 逐行註解：沒有回覆內容時。
+        return "請提供回覆內容，例如：回覆 Message ID:xxx 內容是我收到了。"  # 逐行註解：提示內容格式。
+    payload = original.get("payload", {}) if isinstance(original, dict) else {}  # 逐行註解：取得原郵件 payload。
+    headers = payload.get("headers", []) if isinstance(payload, dict) else []  # 逐行註解：取得原郵件 headers。
+    sender = google_workspace_gmail_header(headers, "From")  # 逐行註解：回覆對象用原寄件者。
+    subject = google_workspace_gmail_header(headers, "Subject") or "Re: 無主旨"  # 逐行註解：取得原主旨。
+    if not subject.lower().startswith("re:"):  # 逐行註解：必要時補 Re:。
+        subject = f"Re: {subject}"  # 逐行註解：建立回覆主旨。
+    extra_headers = {"In-Reply-To": google_workspace_gmail_header(headers, "Message-ID"), "References": google_workspace_gmail_header(headers, "References") or google_workspace_gmail_header(headers, "Message-ID")}  # 逐行註解：維持郵件 thread。
+    service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
+    encoded = google_workspace_build_gmail_raw_message(google_account, sender, subject, body, extra_headers)  # 逐行註解：建立回覆 raw message。
+    sent = service.users().messages().send(userId="me", body={"raw": encoded, "threadId": original.get("threadId")}).execute()  # 逐行註解：寄出回覆並保留 thread。
+    return f"已回覆 Gmail。\n收件者：{sender}\n主旨：{subject}\nMessage ID：{sent.get('id')}"  # 逐行註解：回傳回覆結果。
+
+
+def google_workspace_delete_gmail_message(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：刪除 Gmail 郵件。
+    message = google_workspace_find_gmail_message(user_id, google_account, text)  # 逐行註解：定位郵件。
+    if not message:  # 逐行註解：找不到郵件時。
+        return "請提供要刪除的 Gmail Message ID，或用關鍵字搜尋到郵件。"  # 逐行註解：提示定位資訊。
+    message_id = str(message.get("id") or "").strip()  # 逐行註解：取得 message ID。
+    service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
+    service.users().messages().trash(userId="me", id=message_id).execute()  # 逐行註解：移到 Gmail 垃圾桶。
+    return f"已將 Gmail 郵件移到垃圾桶。\nMessage ID：{message_id}"  # 逐行註解：回傳刪除結果。
+
+
+def google_workspace_archive_gmail_message(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：封存 Gmail 郵件。
+    message = google_workspace_find_gmail_message(user_id, google_account, text)  # 逐行註解：定位郵件。
+    if not message:  # 逐行註解：找不到郵件時。
+        return "請提供要封存的 Gmail Message ID，或用關鍵字搜尋到郵件。"  # 逐行註解：提示定位資訊。
+    message_id = str(message.get("id") or "").strip()  # 逐行註解：取得 message ID。
+    service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
+    service.users().messages().modify(userId="me", id=message_id, body={"removeLabelIds": ["INBOX"]}).execute()  # 逐行註解：移除 INBOX 標籤即封存。
+    return f"已封存 Gmail 郵件。\nMessage ID：{message_id}"  # 逐行註解：回傳封存結果。
+
+
+def google_workspace_get_or_create_gmail_label(service, label_name: str) -> str:  # 逐行註解：取得或建立 Gmail label ID。
+    response = service.users().labels().list(userId="me").execute()  # 逐行註解：列出現有 labels。
+    for label in response.get("labels", []) if isinstance(response, dict) else []:  # 逐行註解：逐一檢查 label。
+        if str(label.get("name") or "").lower() == label_name.lower():  # 逐行註解：名稱相同時。
+            return str(label.get("id") or "")  # 逐行註解：回傳既有 label ID。
+    created = service.users().labels().create(userId="me", body={"name": label_name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()  # 逐行註解：建立新 label。
+    return str(created.get("id") or "")  # 逐行註解：回傳新 label ID。
+
+
+def google_workspace_label_gmail_message(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：套用 Gmail label。
+    message = google_workspace_find_gmail_message(user_id, google_account, text)  # 逐行註解：定位郵件。
+    if not message:  # 逐行註解：找不到郵件時。
+        return "請提供要加標籤的 Gmail Message ID，或用關鍵字搜尋到郵件。"  # 逐行註解：提示定位資訊。
+    label_name = google_workspace_extract_named_value(text, ("標籤", "label")) or "SeanGPT"  # 逐行註解：解析 label 名稱。
+    service = google_workspace_build_service(user_id, google_account, "gmail", "v1")  # 逐行註解：建立 Gmail API service。
+    label_id = google_workspace_get_or_create_gmail_label(service, label_name)  # 逐行註解：取得 label ID。
+    message_id = str(message.get("id") or "").strip()  # 逐行註解：取得 message ID。
+    service.users().messages().modify(userId="me", id=message_id, body={"addLabelIds": [label_id]}).execute()  # 逐行註解：套用 label。
+    return f"已替 Gmail 郵件加上標籤：{label_name}\nMessage ID：{message_id}"  # 逐行註解：回傳標籤結果。
+
+
+def google_workspace_find_calendar_event(user_id: int, google_account: str, text: str) -> dict | None:  # 逐行註解：依 ID 或搜尋字找到 Calendar event。
+    query = google_workspace_extract_event_query(text)  # 逐行註解：抽取 event ID 或標題。
+    if not query:  # 逐行註解：沒有查詢條件。
+        return None  # 逐行註解：回傳 None。
+    service = google_workspace_build_service(user_id, google_account, "calendar", "v3")  # 逐行註解：建立 Calendar API service。
+    if re.fullmatch(r"[A-Za-z0-9_-]{8,}", query):  # 逐行註解：看起來像 ID。
+        return service.events().get(calendarId="primary", eventId=query).execute()  # 逐行註解：直接讀取事件。
+    start, end, _label = google_workspace_calendar_range("今年")  # 逐行註解：搜尋今年範圍。
+    response = service.events().list(calendarId="primary", timeMin=start.isoformat(), timeMax=end.isoformat(), q=query, singleEvents=True, orderBy="startTime", maxResults=1).execute()  # 逐行註解：搜尋符合行程。
+    events = response.get("items", []) if isinstance(response, dict) else []  # 逐行註解：取得 events。
+    return events[0] if events else None  # 逐行註解：回傳第一筆或 None。
+
+
+def google_workspace_update_calendar_event(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：更新 Calendar event。
+    event = google_workspace_find_calendar_event(user_id, google_account, text)  # 逐行註解：定位事件。
+    if not event:  # 逐行註解：找不到事件時。
+        return "請提供要修改的行程 ID，或用「標題是...」指定行程。"  # 逐行註解：提示定位資訊。
+    patch_body: dict[str, object] = {}  # 逐行註解：準備 patch body。
+    new_title_match = re.search(r"(?:改成|新標題是|新名稱是|標題改成)\s*([^，,\n]+)", text or "")  # 逐行註解：解析新標題。
+    if new_title_match and new_title_match.group(1).strip():  # 逐行註解：如果有新標題。
+        patch_body["summary"] = new_title_match.group(1).strip()  # 逐行註解：設定新 summary。
+    new_start = google_workspace_parse_event_start(text)  # 逐行註解：解析新時間。
+    if new_start:  # 逐行註解：如果有新時間。
+        new_end = new_start + google_workspace_parse_event_duration(text)  # 逐行註解：計算新結束時間。
+        patch_body["start"] = {"dateTime": new_start.isoformat(), "timeZone": "Asia/Taipei"}  # 逐行註解：設定新開始時間。
+        patch_body["end"] = {"dateTime": new_end.isoformat(), "timeZone": "Asia/Taipei"}  # 逐行註解：設定新結束時間。
+    if not patch_body:  # 逐行註解：沒有可更新欄位。
+        return "請提供要修改的內容，例如：行程ID:xxx 新標題是會議，或 今天 15:00。"  # 逐行註解：提示更新格式。
+    service = google_workspace_build_service(user_id, google_account, "calendar", "v3")  # 逐行註解：建立 Calendar API service。
+    updated = service.events().patch(calendarId="primary", eventId=str(event.get("id")), body=patch_body).execute()  # 逐行註解：更新事件。
+    return f"已更新行程：{updated.get('summary')}\nID：{updated.get('id')}\n時間：{google_workspace_format_event_time(updated.get('start', {}))} - {google_workspace_format_event_time(updated.get('end', {}))}"  # 逐行註解：回傳更新結果。
+
+
+def google_workspace_search_calendar_events(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：搜尋 Calendar events。
+    query = google_workspace_extract_search_query(text)  # 逐行註解：解析搜尋字。
+    if not query:  # 逐行註解：沒有搜尋字時。
+        return "請提供要搜尋的行程關鍵字。"  # 逐行註解：提示搜尋字。
+    service = google_workspace_build_service(user_id, google_account, "calendar", "v3")  # 逐行註解：建立 Calendar API service。
+    start, end, _label = google_workspace_calendar_range("今年")  # 逐行註解：搜尋今年。
+    response = service.events().list(calendarId="primary", timeMin=start.isoformat(), timeMax=end.isoformat(), q=query, singleEvents=True, orderBy="startTime", maxResults=20).execute()  # 逐行註解：搜尋事件。
+    events = response.get("items", []) if isinstance(response, dict) else []  # 逐行註解：取得結果。
+    if not events:  # 逐行註解：沒有命中。
+        return f"沒有找到行程：{query}"  # 逐行註解：回傳空結果。
+    lines = [f"行程搜尋結果：{query}"]  # 逐行註解：建立標題。
+    for index, event in enumerate(events, start=1):  # 逐行註解：列出行程。
+        lines.append(f"{index}. {event.get('summary')}\n時間：{google_workspace_format_event_time(event.get('start', {}))}\nID：{event.get('id')}")  # 逐行註解：加入事件資訊。
+    return "\n\n".join(lines)  # 逐行註解：回傳搜尋結果。
+
+
+def google_workspace_respond_calendar_invitation(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：回覆 Calendar 邀請。
+    event = google_workspace_find_calendar_event(user_id, google_account, text)  # 逐行註解：定位事件。
+    if not event:  # 逐行註解：找不到事件時。
+        return "請提供要回覆的行程 ID，或用「標題是...」指定邀請。"  # 逐行註解：提示定位資訊。
+    lowered = (text or "").lower()  # 逐行註解：轉小寫判斷回覆狀態。
+    status = "accepted"  # 逐行註解：預設接受邀請。
+    if google_workspace_text_mentions(lowered, ("拒絕", "decline", "rejected")):  # 逐行註解：拒絕邀請。
+        status = "declined"  # 逐行註解：設定 declined。
+    elif google_workspace_text_mentions(lowered, ("也許", "暫定", "maybe", "tentative")):  # 逐行註解：暫定回覆。
+        status = "tentative"  # 逐行註解：設定 tentative。
+    attendees = event.get("attendees", []) if isinstance(event, dict) else []  # 逐行註解：取得既有與會者。
+    updated_attendees = []  # 逐行註解：準備更新與會者清單。
+    matched_self = False  # 逐行註解：記錄是否找到自己的 attendee。
+    for attendee in attendees or []:  # 逐行註解：逐一處理 attendee。
+        item = dict(attendee)  # 逐行註解：複製避免直接改原物件。
+        if str(item.get("email") or "").lower() == google_account.lower():  # 逐行註解：找到自己時更新回覆狀態。
+            item["responseStatus"] = status  # 逐行註解：設定回覆狀態。
+            matched_self = True  # 逐行註解：標記已找到自己。
+        updated_attendees.append(item)  # 逐行註解：保存 attendee。
+    if not matched_self:  # 逐行註解：原事件沒有列出自己時補一筆。
+        updated_attendees.append({"email": google_account, "responseStatus": status})  # 逐行註解：加入自己的回覆狀態。
+    service = google_workspace_build_service(user_id, google_account, "calendar", "v3")  # 逐行註解：建立 Calendar API service。
+    updated = service.events().patch(calendarId="primary", eventId=str(event.get("id")), body={"attendees": updated_attendees}, sendUpdates="all").execute()  # 逐行註解：更新邀請回覆。
+    return f"已回覆 Calendar 邀請：{updated.get('summary')}\n狀態：{status}\nID：{updated.get('id')}"  # 逐行註解：回傳回覆結果。
+
+
+def google_workspace_format_contact(person: dict, index: int | None = None) -> str:  # 逐行註解：格式化 Google Contacts 聯絡人。
+    names = person.get("names", []) if isinstance(person, dict) else []  # 逐行註解：取得姓名欄位。
+    emails = person.get("emailAddresses", []) if isinstance(person, dict) else []  # 逐行註解：取得 email 欄位。
+    phones = person.get("phoneNumbers", []) if isinstance(person, dict) else []  # 逐行註解：取得電話欄位。
+    name = str((names[0] if names else {}).get("displayName") or (names[0] if names else {}).get("givenName") or "未命名聯絡人").strip()  # 逐行註解：取顯示姓名。
+    email = str((emails[0] if emails else {}).get("value") or "無 Email").strip()  # 逐行註解：取第一個 Email。
+    phone = str((phones[0] if phones else {}).get("value") or "無電話").strip()  # 逐行註解：取第一個電話。
+    resource = str(person.get("resourceName") or "").strip()  # 逐行註解：取得 resourceName。
+    prefix = f"{index}. " if index is not None else ""  # 逐行註解：可選編號。
+    return f"{prefix}{name}\nEmail：{email}\n電話：{phone}\nResource：{resource}"  # 逐行註解：回傳聯絡人文字。
+
+
+def google_workspace_contact_matches(person: dict, query: str) -> bool:  # 逐行註解：判斷聯絡人是否符合搜尋字，作為 People searchContacts 的即時 fallback。
+    lowered_query = (query or "").strip().lower()  # 逐行註解：整理搜尋字。
+    if not lowered_query:  # 逐行註解：沒有搜尋字時不匹配。
+        return False  # 逐行註解：回傳不匹配。
+    haystack_parts: list[str] = [str(person.get("resourceName") or "")]  # 逐行註解：先加入 resourceName。
+    for field_name in ("names", "emailAddresses", "phoneNumbers"):  # 逐行註解：搜尋姓名、Email 與電話欄位。
+        for item in person.get(field_name, []) or []:  # 逐行註解：逐一讀取欄位項目。
+            if isinstance(item, dict):  # 逐行註解：People API 欄位是 dict。
+                haystack_parts.extend(str(value or "") for value in item.values())  # 逐行註解：把 dict 裡的文字值加入搜尋。
+    return lowered_query in " ".join(haystack_parts).lower()  # 逐行註解：只要任一欄位包含搜尋字就視為命中。
+
+
+def google_workspace_filter_contacts_from_connections(service, query: str, limit: int = 10) -> list[dict]:  # 逐行註解：用 connections.list 即時過濾聯絡人，避免 searchContacts 索引延遲。
+    response = service.people().connections().list(resourceName="people/me", pageSize=100, personFields="names,emailAddresses,phoneNumbers,metadata").execute()  # 逐行註解：列出最近聯絡人連線。
+    contacts = response.get("connections", []) if isinstance(response, dict) else []  # 逐行註解：取得聯絡人清單。
+    return [person for person in contacts if google_workspace_contact_matches(person, query)][:limit]  # 逐行註解：回傳符合搜尋字的前幾筆。
+
+
+def google_workspace_list_contacts(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：列出 Google Contacts。
+    service = google_workspace_build_service(user_id, google_account, "people", "v1")  # 逐行註解：建立 People API service。
+    response = service.people().connections().list(resourceName="people/me", pageSize=30, personFields="names,emailAddresses,phoneNumbers").execute()  # 逐行註解：列出 contacts。
+    contacts = response.get("connections", []) if isinstance(response, dict) else []  # 逐行註解：取得聯絡人清單。
+    if not contacts:  # 逐行註解：沒有聯絡人時。
+        return "Google Contacts 沒有找到聯絡人。"  # 逐行註解：回傳空結果。
+    return "Google Contacts 清單：\n\n" + "\n\n".join(google_workspace_format_contact(person, index) for index, person in enumerate(contacts, start=1))  # 逐行註解：回傳聯絡人清單。
+
+
+def google_workspace_search_contacts(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：搜尋 Google Contacts。
+    query = google_workspace_extract_search_query(text) or google_workspace_extract_recipient_name(text)  # 逐行註解：解析搜尋字。
+    if not query:  # 逐行註解：沒有搜尋字時。
+        return "請提供要搜尋的聯絡人名稱或 Email。"  # 逐行註解：提示搜尋格式。
+    service = google_workspace_build_service(user_id, google_account, "people", "v1")  # 逐行註解：建立 People API service。
+    response = service.people().searchContacts(query=query, readMask="names,emailAddresses,phoneNumbers", pageSize=10).execute()  # 逐行註解：搜尋 contacts。
+    results = response.get("results", []) if isinstance(response, dict) else []  # 逐行註解：取得搜尋結果。
+    contacts = [item.get("person", {}) for item in results if isinstance(item, dict)]  # 逐行註解：取出 person。
+    if not contacts:  # 逐行註解：Google searchContacts 對剛建立的聯絡人可能有索引延遲。
+        contacts = google_workspace_filter_contacts_from_connections(service, query, limit=10)  # 逐行註解：改用 connections.list 即時過濾。
+    if not contacts:  # 逐行註解：沒有命中時。
+        return f"沒有找到聯絡人：{query}"  # 逐行註解：回傳空結果。
+    return f"Google Contacts 搜尋結果：{query}\n\n" + "\n\n".join(google_workspace_format_contact(person, index) for index, person in enumerate(contacts, start=1))  # 逐行註解：回傳搜尋結果。
+
+
+def google_workspace_find_contact(user_id: int, google_account: str, query: str) -> dict | None:  # 逐行註解：找到第一個符合的 Google Contact。
+    if re.fullmatch(r"people/[A-Za-z0-9_-]+", query or ""):  # 逐行註解：如果已提供 resourceName。
+        service = google_workspace_build_service(user_id, google_account, "people", "v1")  # 逐行註解：建立 People API service。
+        return service.people().get(resourceName=query, personFields="names,emailAddresses,phoneNumbers,metadata").execute()  # 逐行註解：直接讀取 contact。
+    service = google_workspace_build_service(user_id, google_account, "people", "v1")  # 逐行註解：建立 People API service。
+    response = service.people().searchContacts(query=query, readMask="names,emailAddresses,phoneNumbers,metadata", pageSize=1).execute()  # 逐行註解：搜尋第一筆 contact。
+    results = response.get("results", []) if isinstance(response, dict) else []  # 逐行註解：取得 results。
+    if results and isinstance(results[0], dict):  # 逐行註解：searchContacts 命中時。
+        return results[0].get("person")  # 逐行註解：回傳第一個 person。
+    fallback_contacts = google_workspace_filter_contacts_from_connections(service, query, limit=1)  # 逐行註解：searchContacts 未命中時改用 connections.list 即時過濾。
+    return fallback_contacts[0] if fallback_contacts else None  # 逐行註解：回傳 fallback 第一筆或 None。
+
+
+def google_workspace_create_contact(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：建立 Google Contact。
+    email = google_workspace_extract_email(text)  # 逐行註解：解析 Email。
+    name = google_workspace_extract_named_value(text, ("姓名", "名稱", "name")) or google_workspace_extract_title(text, default_title="") or google_workspace_extract_recipient_name(text)  # 逐行註解：解析姓名。
+    phone = google_workspace_extract_named_value(text, ("電話", "phone", "手機"))  # 逐行註解：解析電話。
+    if not name:  # 逐行註解：姓名必填。
+        return "請提供聯絡人姓名，例如：建立聯絡人 姓名是 Sean email 是 sean@example.com。"  # 逐行註解：提示姓名格式。
+    body: dict[str, object] = {"names": [{"givenName": name}]}  # 逐行註解：建立 contact body。
+    if email:  # 逐行註解：有 email 時加入。
+        body["emailAddresses"] = [{"value": email}]  # 逐行註解：設定 email。
+    if phone:  # 逐行註解：有電話時加入。
+        body["phoneNumbers"] = [{"value": phone}]  # 逐行註解：設定電話。
+    service = google_workspace_build_service(user_id, google_account, "people", "v1")  # 逐行註解：建立 People API service。
+    person = service.people().createContact(body=body).execute()  # 逐行註解：建立 contact。
+    return "已建立 Google Contact：\n" + google_workspace_format_contact(person)  # 逐行註解：回傳建立結果。
+
+
+def google_workspace_update_contact(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：更新 Google Contact。
+    query = google_workspace_extract_search_query(text) or google_workspace_extract_recipient_name(text) or google_workspace_extract_named_value(text, ("resource", "resourceName", "聯絡人ID"))  # 逐行註解：解析要更新的 contact。
+    if not query:  # 逐行註解：沒有定位條件時。
+        return "請提供要修改的聯絡人名稱、Email 或 resourceName。"  # 逐行註解：提示定位格式。
+    person = google_workspace_find_contact(user_id, google_account, query)  # 逐行註解：找到 contact。
+    if not person:  # 逐行註解：找不到 contact。
+        return f"沒有找到聯絡人：{query}"  # 逐行註解：回傳空結果。
+    name = google_workspace_extract_named_value(text, ("新姓名", "姓名", "新名稱", "name"))  # 逐行註解：解析新姓名。
+    email = google_workspace_extract_email(text)  # 逐行註解：解析新 Email。
+    phone = google_workspace_extract_named_value(text, ("電話", "phone", "手機"))  # 逐行註解：解析新電話。
+    update_fields: list[str] = []  # 逐行註解：保存更新欄位。
+    if name:  # 逐行註解：有姓名時更新。
+        person["names"] = [{"givenName": name}]  # 逐行註解：設定姓名。
+        update_fields.append("names")  # 逐行註解：加入更新欄位。
+    if email:  # 逐行註解：有 email 時更新。
+        person["emailAddresses"] = [{"value": email}]  # 逐行註解：設定 email。
+        update_fields.append("emailAddresses")  # 逐行註解：加入更新欄位。
+    if phone:  # 逐行註解：有電話時更新。
+        person["phoneNumbers"] = [{"value": phone}]  # 逐行註解：設定電話。
+        update_fields.append("phoneNumbers")  # 逐行註解：加入更新欄位。
+    if not update_fields:  # 逐行註解：沒有新欄位時。
+        return "請提供要更新的姓名、Email 或電話。"  # 逐行註解：提示更新內容。
+    service = google_workspace_build_service(user_id, google_account, "people", "v1")  # 逐行註解：建立 People API service。
+    updated = service.people().updateContact(resourceName=str(person.get("resourceName")), updatePersonFields=",".join(update_fields), body=person).execute()  # 逐行註解：更新 contact。
+    return "已更新 Google Contact：\n" + google_workspace_format_contact(updated)  # 逐行註解：回傳更新結果。
+
+
+def google_workspace_delete_contact(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：刪除 Google Contact。
+    query = google_workspace_extract_search_query(text) or google_workspace_extract_recipient_name(text) or google_workspace_extract_named_value(text, ("resource", "resourceName", "聯絡人ID"))  # 逐行註解：解析要刪除的 contact。
+    if not query:  # 逐行註解：沒有定位條件時。
+        return "請提供要刪除的聯絡人名稱、Email 或 resourceName。"  # 逐行註解：提示定位格式。
+    person = google_workspace_find_contact(user_id, google_account, query)  # 逐行註解：找到 contact。
+    if not person:  # 逐行註解：找不到 contact。
+        return f"沒有找到聯絡人：{query}"  # 逐行註解：回傳空結果。
+    resource_name = str(person.get("resourceName") or "").strip()  # 逐行註解：取得 resourceName。
+    service = google_workspace_build_service(user_id, google_account, "people", "v1")  # 逐行註解：建立 People API service。
+    service.people().deleteContact(resourceName=resource_name).execute()  # 逐行註解：刪除 contact。
+    return f"已刪除 Google Contact。\nResource：{resource_name}"  # 逐行註解：回傳刪除結果。
+
+
+def google_workspace_create_form(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：建立 Google Forms 表單。
+    title = google_workspace_extract_title(text, default_title="未命名表單")  # 逐行註解：解析表單標題。
+    service = google_workspace_build_service(user_id, google_account, "forms", "v1")  # 逐行註解：建立 Forms API service。
+    form = service.forms().create(body={"info": {"title": title}}).execute()  # 逐行註解：建立表單。
+    form_id = str(form.get("formId") or "").strip()  # 逐行註解：取得 form ID。
+    if form_id:  # 逐行註解：Forms API 可能讓 Drive 檔名保持 Untitled form，所以建立後同步 Drive 檔名。
+        drive_service = google_workspace_build_service(user_id, google_account, "drive", "v3")  # 逐行註解：建立 Drive API service。
+        drive_service.files().update(fileId=form_id, body={"name": title}, fields="id,name").execute()  # 逐行註解：同步表單在 Drive 裡的檔名。
+    question = google_workspace_extract_content_text(text)  # 逐行註解：如果有提供問題，建立後新增題目。
+    if question:  # 逐行註解：有題目時。
+        google_workspace_update_form(user_id, google_account, f"id:{form_id} 問題是 {question}")  # 逐行註解：新增題目。
+    return f"已建立 Google Forms 表單：{title}\nID：{form_id}\n連結：https://docs.google.com/forms/d/{form_id}/edit"  # 逐行註解：回傳建立結果。
+
+
+def google_workspace_read_form(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：讀取 Google Form。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_form", text)  # 逐行註解：定位表單。
+    if not file_item:  # 逐行註解：找不到表單時。
+        return "請提供要讀取的 Google Form 連結、表單 ID，或用「標題是...」指定表單。"  # 逐行註解：提示定位格式。
+    service = google_workspace_build_service(user_id, google_account, "forms", "v1")  # 逐行註解：建立 Forms API service。
+    form = service.forms().get(formId=str(file_item.get("id"))).execute()  # 逐行註解：讀取表單。
+    info = form.get("info", {}) if isinstance(form, dict) else {}  # 逐行註解：取得表單 info。
+    items = form.get("items", []) if isinstance(form, dict) else []  # 逐行註解：取得題目。
+    lines = [f"Google Forms：{info.get('title') or file_item.get('name')}", f"ID：{file_item.get('id')}", f"題目數：{len(items)}"]  # 逐行註解：建立表單摘要。
+    for index, item in enumerate(items[:20], start=1):  # 逐行註解：列出前 20 題。
+        lines.append(f"{index}. {item.get('title') or '未命名題目'}")  # 逐行註解：加入題目標題。
+    return "\n".join(lines)  # 逐行註解：回傳表單內容。
+
+
+def google_workspace_update_form(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：更新 Google Form 標題或新增題目。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_form", text)  # 逐行註解：定位表單。
+    if not file_item:  # 逐行註解：找不到表單時。
+        return "請提供要更新的 Google Form 連結、表單 ID，或用「標題是...」指定表單。"  # 逐行註解：提示定位格式。
+    form_id = str(file_item.get("id") or "").strip()  # 逐行註解：取得 form ID。
+    requests_body: list[dict] = []  # 逐行註解：準備 Forms batchUpdate requests。
+    new_title_match = re.search(r"(?:新標題是|新名稱是|改成)\s*([^，,\n]+)", text or "")  # 逐行註解：解析新標題。
+    if new_title_match and new_title_match.group(1).strip():  # 逐行註解：有新標題時。
+        new_title = new_title_match.group(1).strip()  # 逐行註解：保存新標題。
+        requests_body.append({"updateFormInfo": {"info": {"title": new_title}, "updateMask": "title"}})  # 逐行註解：加入更新標題 request。
+    question = google_workspace_extract_content_text(text)  # 逐行註解：解析新增題目文字。
+    if question:  # 逐行註解：有題目時。
+        requests_body.append({"createItem": {"item": {"title": question, "questionItem": {"question": {"required": False, "textQuestion": {"paragraph": False}}}}, "location": {"index": 0}}})  # 逐行註解：加入文字題 request。
+    if not requests_body:  # 逐行註解：沒有更新內容時。
+        return "請提供要更新的表單標題或題目，例如：問題是 Question 1。"  # 逐行註解：提示內容格式。
+    service = google_workspace_build_service(user_id, google_account, "forms", "v1")  # 逐行註解：建立 Forms API service。
+    service.forms().batchUpdate(formId=form_id, body={"requests": requests_body}).execute()  # 逐行註解：更新表單。
+    if new_title_match and new_title_match.group(1).strip():  # 逐行註解：如果表單標題更新，也同步 Drive 檔名。
+        drive_service = google_workspace_build_service(user_id, google_account, "drive", "v3")  # 逐行註解：建立 Drive API service。
+        drive_service.files().update(fileId=form_id, body={"name": new_title_match.group(1).strip()}, fields="id,name").execute()  # 逐行註解：同步 Drive 檔名。
+    return f"已更新 Google Forms：{file_item.get('name')}\nID：{form_id}"  # 逐行註解：回傳更新結果。
+
+
+def google_workspace_read_form_responses(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：讀取 Google Form 回覆。
+    file_item = google_workspace_find_drive_file(user_id, google_account, "google_form", text)  # 逐行註解：定位表單。
+    if not file_item:  # 逐行註解：找不到表單時。
+        return "請提供要讀取回覆的 Google Form 連結、表單 ID，或用「標題是...」指定表單。"  # 逐行註解：提示定位格式。
+    service = google_workspace_build_service(user_id, google_account, "forms", "v1")  # 逐行註解：建立 Forms API service。
+    response = service.forms().responses().list(formId=str(file_item.get("id")), pageSize=20).execute()  # 逐行註解：列出回覆。
+    responses = response.get("responses", []) if isinstance(response, dict) else []  # 逐行註解：取得 responses。
+    if not responses:  # 逐行註解：沒有回覆時。
+        return f"Google Forms：{file_item.get('name')}\n目前沒有回覆。"  # 逐行註解：回傳空結果。
+    lines = [f"Google Forms 回覆：{file_item.get('name')}", f"回覆數：{len(responses)}"]  # 逐行註解：建立摘要。
+    for index, item in enumerate(responses[:10], start=1):  # 逐行註解：列出前 10 筆。
+        lines.append(f"{index}. responseId：{item.get('responseId')}｜時間：{item.get('createTime')}")  # 逐行註解：加入回覆 metadata。
+    return "\n".join(lines)  # 逐行註解：回傳回覆清單。
+
+
+def google_workspace_extract_slide_index(text: str, default_index: int = 1) -> int:  # 逐行註解：抽取投影片頁碼。
+    match = re.search(r"(?:第\s*)?(\d+)\s*(?:頁|張|slide)", text or "", flags=re.I)  # 逐行註解：支援第 2 頁、2 slide。
+    if match:  # 逐行註解：有頁碼時。
+        return max(1, int(match.group(1)))  # 逐行註解：頁碼最小為 1。
+    return default_index  # 逐行註解：沒有頁碼時回傳預設。
+
+
+def google_workspace_find_presentation(user_id: int, google_account: str, text: str) -> dict | None:  # 逐行註解：定位 Google Slides 簡報。
+    return google_workspace_find_drive_file(user_id, google_account, "google_slide", text)  # 逐行註解：沿用 Drive 搜尋能力。
+
+
+def google_workspace_create_slide(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：新增 Google Slides 投影片。
+    presentation_item = google_workspace_find_presentation(user_id, google_account, text)  # 逐行註解：定位簡報。
+    if not presentation_item:  # 逐行註解：找不到簡報時。
+        return "請提供要新增投影片的簡報連結、簡報 ID，或用「標題是...」指定簡報。"  # 逐行註解：提示定位資訊。
+    presentation_id = str(presentation_item.get("id") or "").strip()  # 逐行註解：取得簡報 ID。
+    slide_id = f"sean_slide_{uuid.uuid4().hex[:12]}"  # 逐行註解：建立唯一 slide objectId。
+    text_box_id = f"sean_text_{uuid.uuid4().hex[:12]}"  # 逐行註解：建立唯一 text box objectId。
+    content = google_workspace_extract_content_text(text, default=google_workspace_extract_title(text, default_title=""))  # 逐行註解：解析投影片文字。
+    requests_body: list[dict] = [{"createSlide": {"objectId": slide_id, "slideLayoutReference": {"predefinedLayout": "BLANK"}}}]  # 逐行註解：先建立空白投影片。
+    if content:  # 逐行註解：有內容時加文字框。
+        requests_body.extend([{"createShape": {"objectId": text_box_id, "shapeType": "TEXT_BOX", "elementProperties": {"pageObjectId": slide_id, "size": {"width": {"magnitude": 7000000, "unit": "EMU"}, "height": {"magnitude": 1600000, "unit": "EMU"}}, "transform": {"scaleX": 1, "scaleY": 1, "translateX": 800000, "translateY": 900000, "unit": "EMU"}}}}, {"insertText": {"objectId": text_box_id, "text": content}}])  # 逐行註解：建立文字框並插入文字。
+    service = google_workspace_build_service(user_id, google_account, "slides", "v1")  # 逐行註解：建立 Slides API service。
+    service.presentations().batchUpdate(presentationId=presentation_id, body={"requests": requests_body}).execute()  # 逐行註解：執行投影片新增。
+    return f"已新增投影片到：{presentation_item.get('name')}\nPresentation ID：{presentation_id}\nSlide ID：{slide_id}"  # 逐行註解：回傳新增結果。
+
+
+def google_workspace_update_slide(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：修改 Google Slides 投影片，使用新增文字框方式保留既有內容。
+    presentation_item = google_workspace_find_presentation(user_id, google_account, text)  # 逐行註解：定位簡報。
+    if not presentation_item:  # 逐行註解：找不到簡報時。
+        return "請提供要修改投影片的簡報連結、簡報 ID，或用「標題是...」指定簡報。"  # 逐行註解：提示定位資訊。
+    content = google_workspace_extract_content_text(text)  # 逐行註解：解析要新增的投影片文字。
+    if not content:  # 逐行註解：沒有內容時。
+        return "請提供要放到投影片上的內容，例如：更新投影片 第 1 頁 內容是新標題。"  # 逐行註解：提示內容格式。
+    presentation_id = str(presentation_item.get("id") or "").strip()  # 逐行註解：取得簡報 ID。
+    service = google_workspace_build_service(user_id, google_account, "slides", "v1")  # 逐行註解：建立 Slides API service。
+    presentation = service.presentations().get(presentationId=presentation_id).execute()  # 逐行註解：讀取簡報結構。
+    slides = presentation.get("slides", []) if isinstance(presentation, dict) else []  # 逐行註解：取得投影片清單。
+    if not slides:  # 逐行註解：沒有投影片時。
+        return "這份簡報目前沒有可更新的投影片，請先新增投影片。"  # 逐行註解：提示先新增。
+    slide_index = min(google_workspace_extract_slide_index(text), len(slides)) - 1  # 逐行註解：轉成 0-based index。
+    slide_id = str(slides[slide_index].get("objectId") or "").strip()  # 逐行註解：取得目標 slide objectId。
+    text_box_id = f"sean_text_{uuid.uuid4().hex[:12]}"  # 逐行註解：建立新文字框 ID。
+    requests_body = [{"createShape": {"objectId": text_box_id, "shapeType": "TEXT_BOX", "elementProperties": {"pageObjectId": slide_id, "size": {"width": {"magnitude": 7000000, "unit": "EMU"}, "height": {"magnitude": 1600000, "unit": "EMU"}}, "transform": {"scaleX": 1, "scaleY": 1, "translateX": 800000, "translateY": 900000, "unit": "EMU"}}}}, {"insertText": {"objectId": text_box_id, "text": content}}]  # 逐行註解：新增文字框並插入文字。
+    service.presentations().batchUpdate(presentationId=presentation_id, body={"requests": requests_body}).execute()  # 逐行註解：執行投影片更新。
+    return f"已更新投影片：第 {slide_index + 1} 頁\nPresentation ID：{presentation_id}\nSlide ID：{slide_id}"  # 逐行註解：回傳更新結果。
+
+
+def google_workspace_delete_slide(user_id: int, google_account: str, text: str) -> str:  # 逐行註解：刪除 Google Slides 投影片。
+    presentation_item = google_workspace_find_presentation(user_id, google_account, text)  # 逐行註解：定位簡報。
+    if not presentation_item:  # 逐行註解：找不到簡報時。
+        return "請提供要刪除投影片的簡報連結、簡報 ID，或用「標題是...」指定簡報。"  # 逐行註解：提示定位資訊。
+    presentation_id = str(presentation_item.get("id") or "").strip()  # 逐行註解：取得簡報 ID。
+    service = google_workspace_build_service(user_id, google_account, "slides", "v1")  # 逐行註解：建立 Slides API service。
+    presentation = service.presentations().get(presentationId=presentation_id).execute()  # 逐行註解：讀取簡報結構。
+    slides = presentation.get("slides", []) if isinstance(presentation, dict) else []  # 逐行註解：取得投影片清單。
+    if not slides:  # 逐行註解：沒有投影片時。
+        return "這份簡報沒有可刪除的投影片。"  # 逐行註解：回傳空結果。
+    slide_index = min(google_workspace_extract_slide_index(text), len(slides)) - 1  # 逐行註解：解析目標頁碼。
+    slide_id = str(slides[slide_index].get("objectId") or "").strip()  # 逐行註解：取得 slide objectId。
+    service.presentations().batchUpdate(presentationId=presentation_id, body={"requests": [{"deleteObject": {"objectId": slide_id}}]}).execute()  # 逐行註解：刪除投影片。
+    return f"已刪除投影片：第 {slide_index + 1} 頁\nPresentation ID：{presentation_id}\nSlide ID：{slide_id}"  # 逐行註解：回傳刪除結果。
+
+
 def google_workspace_settings_text(user_id: int, profile: dict) -> str:  # 逐行註解：整理目前 Google Workspace 設定給使用者查看。
     account = str(profile.get("google_account") or "尚未設定").strip()  # 逐行註解：取得目前 Google 帳號。
     last_tool = str(profile.get("last_tool") or "").strip()  # 逐行註解：取得最後選擇工具 value。
@@ -5493,7 +6467,8 @@ def google_workspace_settings_text(user_id: int, profile: dict) -> str:  # 逐�
 
 
 def google_workspace_requires_google_api(actions: list[str]) -> bool:  # 逐行註解：判斷這次動作是否需要打 Google API。
-    return any(action in {"list", "create", "delete", "read", "edit"} for action in actions)  # 逐行註解：設定查詢不需要 API，其他都需要。
+    api_actions = {"list", "search", "create", "create_slide", "update_slide", "delete_slide", "delete", "read", "edit", "rename", "append", "clear", "upload", "download", "move", "send", "draft", "reply", "archive", "label"}  # 逐行註解：所有會碰 Google API 的動作。
+    return any(action in api_actions for action in actions)  # 逐行註解：設定查詢不需要 API，其他 Workspace 動作都需要。
 
 
 def google_workspace_api_not_ready_text(user_id: int, google_account: str) -> str:  # 逐行註解：建立 Google API 尚未可用時的清楚提示。
@@ -5511,6 +6486,12 @@ def google_workspace_dispatch_calendar(user_id: int, google_account: str, action
             results.append(google_workspace_delete_calendar_event(user_id, google_account, text))  # 逐行註解：刪除指定行程。
         elif action == "create":  # 逐行註解：新增行程。
             results.append(google_workspace_create_calendar_event(user_id, google_account, text))  # 逐行註解：建立指定行程。
+        elif action == "edit":  # 逐行註解：修改行程。
+            results.append(google_workspace_update_calendar_event(user_id, google_account, text))  # 逐行註解：更新指定行程。
+        elif action == "reply":  # 逐行註解：回覆 Calendar 邀請。
+            results.append(google_workspace_respond_calendar_invitation(user_id, google_account, text))  # 逐行註解：接受、拒絕或暫定邀請。
+        elif action == "search":  # 逐行註解：搜尋行程。
+            results.append(google_workspace_search_calendar_events(user_id, google_account, text))  # 逐行註解：搜尋 Calendar events。
         elif action == "list":  # 逐行註解：列出行程。
             results.append(google_workspace_list_calendar_events(user_id, google_account, text))  # 逐行註解：列出指定範圍行程。
     if not results:  # 逐行註解：沒有任何可執行動作時預設列行程。
@@ -5521,11 +6502,21 @@ def google_workspace_dispatch_calendar(user_id: int, google_account: str, action
 def google_workspace_dispatch_gmail(user_id: int, google_account: str, actions: list[str], text: str) -> list[str]:  # 逐行註解：執行 Gmail 相關動作。
     results: list[str] = []  # 逐行註解：保存 Gmail 多個動作結果。
     for action in actions:  # 逐行註解：依解析出的語句順序執行 Gmail 動作。
-        if action == "create":  # 逐行註解：撰寫 Gmail 會建立草稿。
+        if action in {"draft", "create"}:  # 逐行註解：撰寫 Gmail 會建立草稿。
             results.append(google_workspace_create_gmail_draft(user_id, google_account, text))  # 逐行註解：建立 Gmail 草稿。
+        elif action == "send":  # 逐行註解：寄出 Gmail。
+            results.append(google_workspace_send_gmail_email(user_id, google_account, text))  # 逐行註解：直接寄出郵件。
+        elif action == "reply":  # 逐行註解：回覆 Gmail。
+            results.append(google_workspace_reply_gmail_message(user_id, google_account, text))  # 逐行註解：回覆指定郵件。
+        elif action == "delete":  # 逐行註解：刪除 Gmail。
+            results.append(google_workspace_delete_gmail_message(user_id, google_account, text))  # 逐行註解：移到垃圾桶。
+        elif action == "archive":  # 逐行註解：封存 Gmail。
+            results.append(google_workspace_archive_gmail_message(user_id, google_account, text))  # 逐行註解：移除 INBOX。
+        elif action == "label":  # 逐行註解：套用 Gmail 標籤。
+            results.append(google_workspace_label_gmail_message(user_id, google_account, text))  # 逐行註解：建立或套用標籤。
         elif action == "read":  # 逐行註解：讀取指定或搜尋到的 Gmail。
             results.append(google_workspace_read_gmail_message(user_id, google_account, text))  # 逐行註解：讀取 Gmail 內容。
-        elif action == "list":  # 逐行註解：列出最近或符合條件的 Gmail。
+        elif action in {"list", "search"}:  # 逐行註解：列出或搜尋最近 Gmail。
             results.append(google_workspace_list_gmail_messages(user_id, google_account, text))  # 逐行註解：列出 Gmail 郵件清單。
     if not results:  # 逐行註解：沒有任何可執行動作時預設列郵件。
         results.append(google_workspace_list_gmail_messages(user_id, google_account, text))  # 逐行註解：列出 Gmail 郵件清單。
@@ -5535,35 +6526,92 @@ def google_workspace_dispatch_gmail(user_id: int, google_account: str, actions: 
 def google_workspace_dispatch_files(user_id: int, google_account: str, tool: str, actions: list[str], text: str) -> list[str]:  # 逐行註解：執行 Drive、Docs、Slides、Sheets 類檔案動作。
     results: list[str] = []  # 逐行註解：保存檔案動作結果。
     for action in actions:  # 逐行註解：依解析出的語句順序執行檔案動作。
-        if action == "list":  # 逐行註解：列出檔案。
+        if action in {"list", "search"}:  # 逐行註解：列出或搜尋檔案。
             results.append(google_workspace_list_drive_files(user_id, google_account, tool, text))  # 逐行註解：列出 Drive 檔案。
-        elif action == "create" and tool == "google_slide":  # 逐行註解：目前檔案建立優先支援 Google Slides。
+        elif action == "create" and tool == "google_doc":  # 逐行註解：建立 Docs 文件。
+            results.append(google_workspace_create_document(user_id, google_account, text))  # 逐行註解：建立 Google Docs。
+        elif action == "create" and tool == "google_slide" and "create_slide" not in actions:  # 逐行註解：建立 Slides 簡報。
             results.append(google_workspace_create_presentation(user_id, google_account, google_workspace_extract_title(text, default_title="未命名簡報")))  # 逐行註解：建立新簡報。
-        elif action == "create" and tool != "google_calendar":  # 逐行註解：其他 Workspace 檔案建立尚未實作。
-            results.append(f"{google_workspace_tool_label(tool)} 目前支援列出、讀取、改名；建立新檔目前先支援 Google Slides。")  # 逐行註解：清楚說明目前建立檔案限制。
-        elif action == "edit" and google_workspace_text_mentions(text, ("改名", "更名", "rename")):  # 逐行註解：改名類編輯走 Drive update。
+        elif action == "create_slide" and tool == "google_slide":  # 逐行註解：新增單張投影片。
+            results.append(google_workspace_create_slide(user_id, google_account, text))  # 逐行註解：建立投影片。
+        elif action == "update_slide" and tool == "google_slide":  # 逐行註解：修改單張投影片。
+            results.append(google_workspace_update_slide(user_id, google_account, text))  # 逐行註解：更新投影片。
+        elif action == "delete_slide" and tool == "google_slide":  # 逐行註解：刪除單張投影片。
+            results.append(google_workspace_delete_slide(user_id, google_account, text))  # 逐行註解：刪除投影片。
+        elif action == "delete" and tool == "google_slide" and "delete_slide" in actions:  # 逐行註解：刪投影片時不要再把整份簡報刪掉。
+            continue  # 逐行註解：跳過通用刪檔動作。
+        elif action == "create" and tool == "google_sheet":  # 逐行註解：建立 Sheets 試算表。
+            results.append(google_workspace_create_sheet(user_id, google_account, text))  # 逐行註解：建立 Google Sheets。
+        elif action == "create" and tool == "google_form":  # 逐行註解：建立 Forms 表單。
+            results.append(google_workspace_create_form(user_id, google_account, text))  # 逐行註解：建立 Google Forms。
+        elif action == "create" and tool == "google_drive" and google_workspace_text_mentions(text, ("資料夾", "folder")):  # 逐行註解：建立 Drive 資料夾。
+            results.append(google_workspace_create_drive_folder(user_id, google_account, text))  # 逐行註解：建立資料夾。
+        elif action == "create" and tool == "google_drive":  # 逐行註解：Drive 一般 create 預設建立資料夾。
+            results.append(google_workspace_create_drive_folder(user_id, google_account, text))  # 逐行註解：建立資料夾。
+        elif action == "rename":  # 逐行註解：重新命名 Drive 檔案。
             results.append(google_workspace_rename_file(user_id, google_account, tool, text))  # 逐行註解：重新命名檔案。
-        elif action == "edit" and tool == "google_doc":  # 逐行註解：Docs 編輯支援追加文字。
-            results.append(google_workspace_append_doc_text(user_id, google_account, tool, text))  # 逐行註解：把文字追加到 Docs 文件。
-        elif action == "edit":  # 逐行註解：其他編輯類型暫不自動修改。
-            results.append("目前自動編輯支援：Google Docs 追加文字、Drive 檔案改名。請提供文件 ID、檔案 ID 或標題。")  # 逐行註解：回覆可用編輯能力。
+        elif action == "edit" and tool == "google_doc":  # 逐行註解：更新 Docs 文件。
+            results.append(google_workspace_update_document(user_id, google_account, text))  # 逐行註解：更新或覆蓋 Docs。
+        elif action == "append" and tool == "google_doc":  # 逐行註解：追加 Docs 文字。
+            results.append(google_workspace_update_document(user_id, google_account, text, overwrite=False))  # 逐行註解：追加文件內容。
+        elif action == "clear" and tool == "google_doc":  # 逐行註解：清空 Docs 後寫入可選內容。
+            results.append(google_workspace_update_document(user_id, google_account, text, overwrite=True))  # 逐行註解：覆蓋文件內容。
+        elif action == "edit" and tool == "google_sheet":  # 逐行註解：更新 Sheets cells。
+            results.append(google_workspace_update_sheet_cells(user_id, google_account, text))  # 逐行註解：更新儲存格。
+        elif action == "append" and tool == "google_sheet":  # 逐行註解：追加 Sheets rows。
+            results.append(google_workspace_append_sheet_rows(user_id, google_account, text))  # 逐行註解：追加資料列。
+        elif action == "clear" and tool == "google_sheet":  # 逐行註解：清除 Sheets range。
+            results.append(google_workspace_clear_sheet_range(user_id, google_account, text))  # 逐行註解：清除範圍。
+        elif action == "edit" and tool == "google_form":  # 逐行註解：更新 Forms。
+            results.append(google_workspace_update_form(user_id, google_account, text))  # 逐行註解：更新表單。
+        elif action == "upload" and tool == "google_drive":  # 逐行註解：上傳 Drive 檔案。
+            results.append(google_workspace_upload_drive_file(user_id, google_account, text))  # 逐行註解：上傳本機檔案。
+        elif action == "download":  # 逐行註解：下載 Drive 檔案。
+            results.append(google_workspace_download_drive_file(user_id, google_account, tool, text))  # 逐行註解：下載或匯出檔案。
+        elif action == "move" and tool == "google_drive":  # 逐行註解：移動 Drive 檔案。
+            results.append(google_workspace_move_drive_file(user_id, google_account, text))  # 逐行註解：移動檔案到資料夾。
         elif action == "read":  # 逐行註解：讀取檔案內容或摘要。
-            results.append(google_workspace_read_file(user_id, google_account, tool, text))  # 逐行註解：讀取檔案。
+            if tool == "google_sheet":  # 逐行註解：Sheets 讀取範圍值。
+                results.append(google_workspace_read_sheet(user_id, google_account, text))  # 逐行註解：讀取試算表資料。
+            elif tool == "google_form" and google_workspace_text_mentions(text, ("回覆", "responses", "response")):  # 逐行註解：Forms 回覆讀取。
+                results.append(google_workspace_read_form_responses(user_id, google_account, text))  # 逐行註解：讀取表單回覆。
+            elif tool == "google_form":  # 逐行註解：Forms 本體讀取。
+                results.append(google_workspace_read_form(user_id, google_account, text))  # 逐行註解：讀取表單。
+            else:  # 逐行註解：其他檔案用通用讀取。
+                results.append(google_workspace_read_file(user_id, google_account, tool, text))  # 逐行註解：讀取檔案。
         elif action == "delete":  # 逐行註解：避免誤刪 Drive 檔案。
-            results.append("Drive 檔案刪除目前不自動執行；如果要開放刪檔，建議之後加二次確認按鈕。")  # 逐行註解：保守處理刪檔需求。
+            results.append(google_workspace_delete_drive_file(user_id, google_account, tool, text))  # 逐行註解：刪除檔案。
     if not results:  # 逐行註解：沒有任何可執行動作時預設列檔。
         results.append(google_workspace_list_drive_files(user_id, google_account, tool, text))  # 逐行註解：列出 Drive 檔案。
     return results  # 逐行註解：回傳檔案結果清單。
+
+
+def google_workspace_dispatch_contacts(user_id: int, google_account: str, actions: list[str], text: str) -> list[str]:  # 逐行註解：執行 Google Contacts 相關動作。
+    results: list[str] = []  # 逐行註解：保存 Contacts 結果。
+    for action in actions:  # 逐行註解：依序執行 Contacts 動作。
+        if action == "create":  # 逐行註解：建立聯絡人。
+            results.append(google_workspace_create_contact(user_id, google_account, text))  # 逐行註解：建立 Contact。
+        elif action == "edit":  # 逐行註解：更新聯絡人。
+            results.append(google_workspace_update_contact(user_id, google_account, text))  # 逐行註解：更新 Contact。
+        elif action == "delete":  # 逐行註解：刪除聯絡人。
+            results.append(google_workspace_delete_contact(user_id, google_account, text))  # 逐行註解：刪除 Contact。
+        elif action == "search":  # 逐行註解：搜尋聯絡人。
+            results.append(google_workspace_search_contacts(user_id, google_account, text))  # 逐行註解：搜尋 Contacts。
+        elif action == "list":  # 逐行註解：列出聯絡人。
+            results.append(google_workspace_list_contacts(user_id, google_account, text))  # 逐行註解：列出 Contacts。
+    if not results:  # 逐行註解：沒有明確動作時預設列出。
+        results.append(google_workspace_list_contacts(user_id, google_account, text))  # 逐行註解：列出 Contacts。
+    return results  # 逐行註解：回傳 Contacts 結果。
 
 
 def perform_google_workspace_task(user_id: int, profile: dict, text: str) -> str:  # 逐行註解：依使用者文字執行 Google Workspace 任務。
     account = str(profile.get("google_account") or "").strip()  # 逐行註解：取得該使用者自己的 Google 帳號。
     if not account:  # 逐行註解：沒有帳號時不能執行 Workspace 任務。
         return "尚未設定 Google 帳號，請先執行 /google_workspace 輸入你的 Google 帳號。"  # 逐行註解：提示先設定帳號。
+    tool = google_workspace_detect_tool_from_text(profile, text)  # 逐行註解：先依 Auto 或文字內容判斷工具，後面帳號檢查需要知道是否是 Gmail。
     mentioned_account = google_workspace_extract_email(text)  # 逐行註解：檢查使用者文字是否提到 Email。
-    if mentioned_account and mentioned_account.lower() != account.lower():  # 逐行註解：避免用 A 使用者設定去操作另一個 Google 帳號字串。
+    if mentioned_account and mentioned_account.lower() != account.lower() and google_workspace_email_should_match_account(tool, text):  # 逐行註解：避免用 A 使用者設定去操作另一個 Google 帳號字串，但 Gmail 收件人不算帳號切換。
         return f"你目前 /google_workspace 設定的帳號是 {account}，但訊息提到 {mentioned_account}。\n我不會自動切換帳號；請用 /google_workspace 的「更換帳號」改成要操作的帳號後再試。"  # 逐行註解：保護每位使用者自己的帳號隔離。
-    tool = google_workspace_detect_tool_from_text(profile, text)  # 逐行註解：依 Auto 或文字內容判斷工具。
     actions = google_workspace_detect_actions(text)  # 逐行註解：解析要執行的動作。
     if "settings" in actions and len(actions) == 1:  # 逐行註解：純設定查詢不需要 Google API。
         return google_workspace_settings_text(user_id, profile)  # 逐行註解：回傳目前設定。
@@ -5579,6 +6627,8 @@ def perform_google_workspace_task(user_id: int, profile: dict, text: str) -> str
             results.extend(google_workspace_dispatch_calendar(user_id, account, actions, text))  # 逐行註解：執行 Calendar 動作。
         elif tool == "google_gmail":  # 逐行註解：Gmail 任務走 Gmail dispatcher。
             results.extend(google_workspace_dispatch_gmail(user_id, account, actions, text))  # 逐行註解：執行 Gmail 動作。
+        elif tool == "google_contacts":  # 逐行註解：Contacts 任務走聯絡人 dispatcher。
+            results.extend(google_workspace_dispatch_contacts(user_id, account, actions, text))  # 逐行註解：執行 Contacts 動作。
         else:  # 逐行註解：其他工具走 Drive/Docs/Slides/Sheets dispatcher。
             results.extend(google_workspace_dispatch_files(user_id, account, tool, actions, text))  # 逐行註解：執行檔案動作。
         return "\n\n---\n\n".join(result for result in results if result.strip()) or "Google Workspace 任務已處理，但沒有產生可顯示結果。"  # 逐行註解：合併多個動作結果。
@@ -5599,12 +6649,17 @@ def google_workspace_message_should_handle(user_id: int, text: str) -> bool:  # 
         return False  # 逐行註解：不接管 slash command。
     if google_workspace_text_mentions(text, GOOGLE_WORKSPACE_TASK_KEYWORDS):  # 逐行註解：有 Workspace 關鍵字就接管。
         return True  # 逐行註解：交給 Workspace handler。
-    if last_tool in {"google_auto", "google_drive", "google_doc", "google_slide", "google_sheet", "google_form", "google_calendar", "google_gmail"} and google_workspace_text_mentions(text, ("列出", "讀取", "新增", "建立", "刪除", "編輯", "改名", "撰寫", "搜尋")):  # 逐行註解：已選 Workspace 工具且文字像任務時也接管。
+    if last_tool in {"google_auto", "google_drive", "google_doc", "google_slide", "google_sheet", "google_form", "google_calendar", "google_gmail", "google_contacts"} and google_workspace_text_mentions(text, GOOGLE_WORKSPACE_FOLLOWUP_ACTION_KEYWORDS):  # 逐行註解：已選 Workspace 工具且文字像任務時也接管，英文任務也包含在內。
         return True  # 逐行註解：交給 Workspace handler。
     return False  # 逐行註解：其他一般聊天仍走原本 AI。
 
 
 async def handle_google_workspace_message(message: discord.Message, user_text: str) -> bool:  # 逐行註解：處理 /google_workspace 模式下的後續 DM 任務。
+    if not google_workspace_discord_user_is_allowed(message.author):  # 逐行註解：一般訊息進入 Workspace 前也要檢查 Discord 身分。
+        if google_workspace_text_mentions(user_text, GOOGLE_WORKSPACE_TASK_KEYWORDS):  # 逐行註解：非 SUPER_USER 明確要求 Workspace 任務時直接回拒絕訊息。
+            await message.channel.send(google_workspace_permission_message())  # 逐行註解：依需求回覆 not Super user。
+            return True  # 逐行註解：已處理拒絕訊息，不再交給一般 AI 聊天。
+        return False  # 逐行註解：不是 SUPER_USER 就交回一般聊天流程。
     if not google_workspace_message_should_handle(message.author.id, user_text):  # 逐行註解：不符合 Workspace 任務時不接管。
         return False  # 逐行註解：讓原本聊天流程繼續。
     profile = get_google_workspace_profile(message.author.id)  # 逐行註解：讀取該使用者自己的 Workspace 設定。
@@ -5663,6 +6718,9 @@ class GoogleWorkspaceAccountModal(discord.ui.Modal):  # 逐行註解：建立輸
         if interaction.user.id != self.user_id:  # 逐行註解：避免其他使用者提交不屬於自己的 Modal。
             await interaction.response.send_message("這不是你的 Google Workspace 帳號設定視窗。", ephemeral=True)  # 逐行註解：提醒使用者不能操作別人的設定。
             return  # 逐行註解：拒絕後停止。
+        if not google_workspace_discord_user_is_allowed(interaction.user):  # 逐行註解：Modal 送出時再次確認 Discord 使用者是否為 SUPER_USER。
+            await interaction.response.send_message(google_workspace_permission_message(), ephemeral=True)  # 逐行註解：非 SUPER_USER 不能保存 Google Workspace 帳號。
+            return  # 逐行註解：拒絕後停止。
         try:  # 逐行註解：Email 驗證與寫入可能失敗，所以用 try 保護。
             profile = save_google_workspace_profile(interaction.user.id, google_account=str(self.google_email_input.value))  # 逐行註解：驗證並保存該使用者自己的 Google 帳號。
         except ValueError as exc:  # 逐行註解：捕捉 Email 格式錯誤。
@@ -5686,6 +6744,9 @@ class GoogleWorkspaceToolSelect(discord.ui.Select):  # 逐行註解：建立 Goo
         if interaction.user.id != self.user_id:  # 逐行註解：避免其他使用者操作別人的選單。
             await interaction.response.send_message("這不是你的 Google Workspace 選單。", ephemeral=True)  # 逐行註解：提醒使用者不能操作別人的選單。
             return  # 逐行註解：拒絕後停止。
+        if not google_workspace_discord_user_is_allowed(interaction.user):  # 逐行註解：工具選擇時再次限制只有 SUPER_USER 可用。
+            await interaction.response.send_message(google_workspace_permission_message(), ephemeral=True)  # 逐行註解：非 SUPER_USER 不能切換 Workspace 工具。
+            return  # 逐行註解：拒絕後停止。
         tool_value = str(self.values[0] if self.values else "").strip()  # 逐行註解：取得使用者選到的工具 value。
         profile = get_google_workspace_profile(interaction.user.id)  # 逐行註解：讀取該使用者自己的 Google Workspace 設定。
         google_account = str(profile.get("google_account") or "").strip()  # 逐行註解：取得該使用者自己的 Google 帳號。
@@ -5700,13 +6761,16 @@ class GoogleWorkspaceToolSelect(discord.ui.Select):  # 逐行註解：建立 Goo
 
 class GoogleWorkspaceToolView(discord.ui.View):  # 逐行註解：建立 Google Workspace 工具選擇 View。
     def __init__(self, user_id: int):  # 逐行註解：初始化 View 並綁定 Discord 使用者 ID。
-        super().__init__(timeout=300)  # 逐行註解：選單 5 分鐘後自動失效。
+        super().__init__(timeout=None)  # 逐行註解：Workspace 面板不要在 5 分鐘後失效，避免按鈕顯示卻回報 Interaction failed。
         self.user_id = int(user_id)  # 逐行註解：保存可操作這個 View 的使用者 ID。
         self.add_item(GoogleWorkspaceToolSelect(user_id))  # 逐行註解：加入工具下拉選單。
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:  # 逐行註解：統一限制只有原使用者能操作這個 View。
         if interaction.user.id != self.user_id:  # 逐行註解：如果不是原本使用者。
             await interaction.response.send_message("這不是你的 Google Workspace 選單。", ephemeral=True)  # 逐行註解：回覆不可操作。
+            return False  # 逐行註解：拒絕 callback 繼續執行。
+        if not google_workspace_discord_user_is_allowed(interaction.user):  # 逐行註解：即使是原使用者，也必須是 SUPER_USER。
+            await interaction.response.send_message(google_workspace_permission_message(), ephemeral=True)  # 逐行註解：回覆 Workspace 專用權限限制。
             return False  # 逐行註解：拒絕 callback 繼續執行。
         return True  # 逐行註解：原使用者可以操作。
 
@@ -5729,16 +6793,19 @@ class GoogleWorkspaceToolView(discord.ui.View):  # 逐行註解：建立 Google 
             await asyncio.to_thread(authorize_google_workspace_account, interaction.user.id, google_account)  # 逐行註解：在 thread 中啟動本機 OAuth flow，避免阻塞 event loop。
         except Exception as exc:  # 逐行註解：捕捉 OAuth 失敗。
             traceback.print_exc()  # 逐行註解：後台印出完整授權錯誤。
-            await interaction.followup.send(f"Google 授權失敗：{type(exc).__name__}: {str(exc)[:300]}", ephemeral=True)  # 逐行註解：回覆簡短可理解錯誤。
+            await interaction.followup.send(google_workspace_oauth_error_text(exc), ephemeral=True)  # 逐行註解：回覆整理後的 OAuth 錯誤與修復提示。
             return  # 逐行註解：授權失敗就停止。
         await interaction.followup.send("Google 授權完成。現在可以直接輸入列檔、讀 Gmail、看行程、新增簡報或新增行程。", ephemeral=True)  # 逐行註解：授權成功後提示可開始操作。
 
 
 @tree.command(name="google_workspace", description="選擇 Google Workspace 工具並記住你的 Google 帳號")  # 逐行註解：註冊 /google_workspace slash command。
 async def google_workspace(interaction: discord.Interaction):  # 逐行註解：處理 Google Workspace 工具選擇流程。
-    if not is_allowed_interaction_user(interaction):  # 逐行註解：沿用現有互動權限檢查。
-        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：沒有權限時回覆既有拒絕訊息。
-        return  # 逐行註解：沒有權限就停止。
+    if not google_workspace_discord_user_is_allowed(interaction.user):  # 逐行註解：/google_workspace 只允許 SUPER_USER 進入。
+        await interaction.response.send_message(google_workspace_permission_message(), ephemeral=True)  # 逐行註解：回覆專用拒絕訊息。
+        return  # 逐行註解：沒有 Workspace 專用權限就停止。
+    if not is_allowed_interaction_user(interaction):  # 逐行註解：保留既有互動權限檢查，避免未來 SUPER_USER 規則被改壞。
+        await interaction.response.send_message(NO_PERMISSION_MESSAGE, ephemeral=True)  # 逐行註解：理論上 SUPER_USER 會自動通過，這裡只作為防禦式檢查。
+        return  # 逐行註解：沒有一般互動權限就停止。
     profile = get_google_workspace_profile(interaction.user.id)  # 逐行註解：讀取該使用者自己的 Google Workspace 設定。
     google_account = str(profile.get("google_account") or "").strip()  # 逐行註解：取得已記住的 Google 帳號。
     if not google_account:  # 逐行註解：第一次使用或尚未輸入帳號時。
