@@ -36,14 +36,29 @@ htmlcov/
 *.swo
 *~
 
-# Environment
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 *.env
-.env.local
+*.pem
+*.key
+*.p12
+*.pfx
 .DS_Store
 
-# Local secrets
+# Local OAuth secrets and runtime data
 class10/Super_Discord_bot/google_oauth_client_secret.json
 class10/Super_Discord_bot/google_tokens/
+**/google_oauth_client_secret.json
+**/google_tokens/
+*.log
+
+# Local project backups must stay outside Git history
+class10/Super_Discord_bot_backup_*/
 
 # Jupyter Notebook
 .ipynb_checkpoints

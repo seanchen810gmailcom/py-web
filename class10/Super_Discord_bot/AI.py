@@ -31,6 +31,7 @@ import shlex  # 匯入 shlex：把檔名或路徑安全包成 shell command 可�
 import tempfile  # 匯入 tempfile：暫存使用者上傳的舊 Office 檔，交給 macOS textutil 嘗試轉文字。
 import mimetypes  # 匯入 mimetypes：Drive 上傳檔案時依副檔名推測 MIME type。
 import traceback  # 匯入 traceback：圖表 JSON 或繪圖流程失敗時印出完整錯誤堆疊。
+import hmac  # 匯入 hmac：以固定時間比對 camera 管理密碼，不把密碼印到 log。
 import requests  # 匯入 requests：用來查詢天氣 API 和其他 HTTP 請求。
 from myfunction.myfunction import WwatherAPI  # 匯入 WwatherAPI：天氣查詢工具類別。
 
@@ -39,6 +40,7 @@ from chart_parser import parse_chart_text  # 匯入圖表文字解析工具：�
 from format_utils import SUCCESS, ERROR, symbol_demo_text, WEATHER_TEMP, WEATHER_HUMIDITY, WEATHER_WIND, WEATHER_UMBRELLA, WEATHER_CLOUD, make_markdown_table, split_long_message, make_weather_embed as make_weather_summary_embed, weather_symbol_for_text  # 匯入格式工具：提供狀態符號、天氣符號、表格分段與天氣 Embed。
 from weather_utils import get_current_weather_summary, get_weekly_weather_table, get_today_hourly_table, get_today_rain_table, group_today_weather_periods, extract_today_temperature_series, extract_today_humidity_series, get_weather_alert_messages  # 匯入天氣資料整理工具：把 OpenWeather current/forecast 轉成摘要、表格、圖表序列和危險天氣風險訊息。
 import dataset_utils  # 匯入資料集工具：負責處理 data.gov.tw 資料集頁面與 CSV 下載。
+from camera_server import CameraServer, CameraServerError  # 匯入獨立 camera 模組：管理 Mac 鏡頭、FastAPI 與 MJPEG 串流。
 
 #######################初始化#######################
 def find_env_file():
@@ -97,7 +99,7 @@ ALLOWED_USER_LIST = load_env_list("ALLOWED_USERS")  # 逐行註解：讀取一�
 SUPER_USER_KEYS = set(SUPER_USER_LIST)  # 逐行註解：建立超級使用者集合，讓每次權限判斷能快速查找。
 ALLOWED_USER_KEYS = set(ALLOWED_USER_LIST)  # 逐行註解：建立一般允許使用者集合，讓每次權限判斷能快速查找。
 CONFIGURED_PERMISSION_EMAIL_ALIASES = {key.split("@", 1)[0]: key for key in (SUPER_USER_KEYS | ALLOWED_USER_KEYS) if "@" in key and key.split("@", 1)[0]}  # 逐行註解：把設定中的 email local-part 對應回完整 email，支援 Discord 名稱對應 email。
-SENSITIVE_COMMAND_NAMES = {"agent", "state", "run", "quit", "restart", "shell", "shutdown", "reload", "eval", "exec", "debug", "admin", "web_search", "google_workspace"}  # 逐行註解：集中列出所有只能 SUPER_USERS 使用的敏感指令名稱，包含 web_search 與 google_workspace。
+SENSITIVE_COMMAND_NAMES = {"agent", "state", "run", "quit", "restart", "shell", "shutdown", "reload", "eval", "exec", "debug", "admin", "web_search", "google_workspace", "camera"}  # 逐行註解：集中列出所有只能 SUPER_USERS 使用的敏感指令名稱，camera 整組指令也納入閘門。
 DISCORD_BOT_QUIT_PASSWORD = os.getenv("DISCORD_BOT_QUIT_PASSWORD", "").strip()  # 逐行註解：設定 DISCORD_BOT_QUIT_PASSWORD 這個變數，供後面的流程使用。
 NO_PERMISSION_MESSAGE = "You're not allowed to use this bot."  # 逐行註解：統一設定未在 ALLOWED_USERS 或 SUPER_USERS 時的拒絕文字。
 SENSITIVE_PERMISSION_MESSAGE = "Not super user, asking Sean"  # 逐行註解：統一設定非 SUPER_USERS 使用敏感功能時的拒絕文字，同時表示已通知 Sean 審核。
@@ -105,6 +107,7 @@ GOOGLE_WORKSPACE_SUPER_PERMISSION_MESSAGE = "not Super user"  # 逐行註解：�
 STOP_AI_MESSAGE = "⏹️ Stop Thinking"  # 逐行註解：統一設定 /stop 成功停止 AI 任務時要顯示的文字。
 startup_dm_sent = False  # 逐行註解：設定 startup_dm_sent 這個變數，供後面的流程使用。
 shutdown_dm_sent = False  # 逐行註解：設定 shutdown_dm_sent 這個變數，供後面的流程使用。
+CAMERA_SERVER = CameraServer.from_environment()  # 逐行註解：建立單一 camera manager，防止重複 start 開出多個伺服器或鏡頭。
 
 # 預設文字聊天模型：用 qwen2.5-coder:1.5b 套繁中聊天 Modelfile。
 DEFAULT_CHAT_MODEL = "qwen2.5-coder:1.5b_chat"  # 逐行註解：設定 DEFAULT_CHAT_MODEL 這個變數，供後面的流程使用。
@@ -324,7 +327,8 @@ def sensitive_permission_message() -> str:  # 逐行註解：集中管理敏感�
 
 def interaction_command_name(interaction: discord.Interaction) -> str:  # 逐行註解：從 slash interaction 取出指令名稱，供全域權限閘門判斷敏感指令。
     command = getattr(interaction, "command", None)  # 逐行註解：優先使用 discord.py 解析後的 command 物件。
-    command_name = normalize_user_key(getattr(command, "name", ""))  # 逐行註解：整理 command 物件上的名稱。
+    qualified_name = normalize_user_key(getattr(command, "qualified_name", ""))  # 逐行註解：優先取 camera start 這類群組子指令完整名稱。
+    command_name = qualified_name.split(" ", 1)[0] if qualified_name else normalize_user_key(getattr(command, "name", ""))  # 逐行註解：群組指令回傳根名稱 camera，一般指令維持原名稱。
     if command_name:  # 逐行註解：如果拿得到名稱就直接使用。
         return command_name  # 逐行註解：回傳標準化指令名稱。
     data = getattr(interaction, "data", {}) or {}  # 逐行註解：command 物件不可用時改讀原始 interaction data。
@@ -4692,6 +4696,7 @@ async def on_message(message):  # 逐行註解：定義非同步函式 on_messag
 async def shutdown_bot_from_quit_command():  # 逐行註解：定義非同步函式 shutdown_bot_from_quit_command，可以搭配 await 處理 Discord 或網路等待。
     """讓 /quit 回覆送出去後，再私訊並關閉 bot。"""  # 逐行註解：這行是文字內容，通常用來組 prompt、訊息或後台紀錄。
     await asyncio.sleep(1)  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
+    await asyncio.to_thread(CAMERA_SERVER.stop)  # 逐行註解：關閉 bot 前先釋放 OpenCV 鏡頭、停止串流並清除驗證資料。
     await send_shutdown_dm()  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
     await bot.close()  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
 
@@ -4731,6 +4736,90 @@ async def quit_bot(interaction: discord.Interaction):  # 逐行註解：定義�
         return  # 逐行註解：把結果傳回呼叫這個函式的地方，並結束目前函式。
 
     await interaction.response.send_modal(QuitPasswordModal())  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
+
+
+camera_group = discord.app_commands.Group(name="camera", description="管理 Mac 鏡頭網頁串流")  # 逐行註解：建立 /camera start、/camera stop 與 /camera status 子指令群組。
+
+
+async def deny_non_super_camera_user(interaction: discord.Interaction) -> bool:  # 逐行註解：每個 camera 子指令內部再次執行 SUPER_USERS 權限檢查。
+    if require_super_user(interaction.user):  # 逐行註解：命中 SUPER_USERS 才能繼續 camera 流程。
+        return False  # 逐行註解：回傳 False 表示不需要拒絕這次指令。
+    await send_interaction_permission_denied(interaction, "Not super user")  # 逐行註解：非超級使用者只收到 ephemeral 拒絕訊息。
+    return True  # 逐行註解：回傳 True 讓呼叫端立即停止。
+
+
+@camera_group.command(name="start", description="驗證管理密碼後啟動 Mac 鏡頭串流")  # 逐行註解：註冊 /camera start 子指令。
+@discord.app_commands.describe(password="CAMERA_ADMIN_PASSWORD 管理密碼")  # 逐行註解：在 Discord 指令介面說明 password 參數用途。
+async def camera_start(interaction: discord.Interaction, password: str):  # 逐行註解：只有超級使用者且密碼正確時才會開啟鏡頭。
+    if await deny_non_super_camera_user(interaction):  # 逐行註解：防止非 SUPER_USERS 繞過全域閘門直接呼叫函式。
+        return  # 逐行註解：權限不足時不讀密碼、不開鏡頭。
+    configured_password = os.getenv("CAMERA_ADMIN_PASSWORD", "").strip()  # 逐行註解：每次 start 都從環境讀取密碼，程式碼內沒有預設密碼。
+    if not configured_password:  # 逐行註解：沒有設定密碼時一律拒絕啟動。
+        await interaction.response.send_message(  # 逐行註解：用 ephemeral 訊息告知超級使用者需要的設定。
+            "尚未設定 CAMERA_ADMIN_PASSWORD。請先在 .env 設定後重新啟動 bot。",  # 逐行註解：只顯示變數名，不顯示任何密碼內容。
+            ephemeral=True,  # 逐行註解：避免 camera 管理訊息出現在公開頻道。
+        )  # 逐行註解：結束未設定密碼的回覆。
+        return  # 逐行註解：不開啟 camera 資源。
+    if not hmac.compare_digest(password.strip(), configured_password):  # 逐行註解：用固定時間方式比對使用者輸入與 .env 密碼。
+        await interaction.response.send_message("密碼錯誤，camera 不會啟動。", ephemeral=True)  # 逐行註解：密碼錯誤時只回覆執行者。
+        return  # 逐行註解：密碼錯誤時不開啟 camera 資源。
+
+    await interaction.response.defer(ephemeral=True, thinking=True)  # 逐行註解：開鏡頭可能觸發 macOS 權限等待，先回覆 Discord 避免逾時。
+    try:  # 逐行註解：鏡頭、port 或套件問題都要轉成清楚的 ephemeral 訊息。
+        result = await asyncio.to_thread(CAMERA_SERVER.start)  # 逐行註解：把 OpenCV 與 uvicorn 啟動放到 worker thread，不阻塞 Discord event loop。
+    except CameraServerError as exc:  # 逐行註解：可預期的鏡頭、權限、port 或相依問題會到這裡。
+        await interaction.followup.send(f"Camera 啟動失敗：{exc}", ephemeral=True)  # 逐行註解：只回傳安全錯誤，不包含密碼或驗證碼。
+        return  # 逐行註解：啟動失敗時停止後續回覆。
+    except Exception as exc:  # 逐行註解：非預期錯誤不能讓 bot 崩潰。
+        print(f"Camera 啟動發生非預期錯誤：{type(exc).__name__}: {exc}")  # 逐行註解：後台只印錯誤類型與原因，啟動函式不會把密碼放入例外。
+        await interaction.followup.send("Camera 啟動失敗，請查看 bot 後台錯誤。", ephemeral=True)  # 逐行註解：Discord 不暴露未分類的內部細節。
+        return  # 逐行註解：啟動失敗時停止後續回覆。
+
+    if result.already_running:  # 逐行註解：重複執行 start 時不重開伺服器，也不重生驗證碼。
+        await interaction.followup.send(  # 逐行註解：用 ephemeral 告知目前已在執行。
+            f"Camera 已經在執行。\n觀看網址：{result.viewing_url}",  # 逐行註解：重複 start 不顯示舊驗證碼。
+            ephemeral=True,  # 逐行註解：網址只回覆給執行的超級使用者。
+        )  # 逐行註解：結束重複 start 回覆。
+        return  # 逐行註解：不再建立第二個伺服器。
+
+    await interaction.followup.send(  # 逐行註解：成功後把網址與一次性驗證碼只傳給超級使用者。
+        f"Camera 已啟動。\n"
+        f"觀看網址：{result.viewing_url}\n"
+        f"驗證碼：{result.verification_code}\n"
+        f"有效時間：{result.expires_in_seconds // 60} 分鐘\n"
+        "請讓手機與 Mac 使用同一個區域網路。",  # 逐行註解：提醒本機 HTTP 網址需要同一 LAN 才能直接連線。
+        ephemeral=True,  # 逐行註解：避免公開驗證碼、port 與 Mac 網址。
+    )  # 逐行註解：結束 camera start 成功回覆。
+
+
+@camera_group.command(name="stop", description="停止 Mac 鏡頭與網頁串流")  # 逐行註解：註冊 /camera stop 子指令。
+async def camera_stop(interaction: discord.Interaction):  # 逐行註解：停止時只檢查 SUPER_USERS，不再要求 camera 密碼。
+    if await deny_non_super_camera_user(interaction):  # 逐行註解：非超級使用者一律拒絕。
+        return  # 逐行註解：權限不足時不釋放或改動 camera 狀態。
+    await interaction.response.defer(ephemeral=True, thinking=True)  # 逐行註解：釋放 OpenCV 與等待 uvicorn 關閉可能超過 Discord 時限。
+    was_active = await asyncio.to_thread(CAMERA_SERVER.stop)  # 逐行註解：在 worker thread 關鏡頭、停串流、清驗證碼與釋放資源。
+    message = "Camera 已停止，鏡頭、串流與驗證資料已清除。" if was_active else "Camera 原本就沒有啟動。"  # 逐行註解：明確回報這次是停止成功或原本已停止。
+    await interaction.followup.send(message, ephemeral=True)  # 逐行註解：停止結果只顯示給超級使用者。
+
+
+@camera_group.command(name="status", description="查看 Mac 鏡頭與網頁串流狀態")  # 逐行註解：註冊 /camera status 子指令。
+async def camera_status(interaction: discord.Interaction):  # 逐行註解：狀態只顯示布林與 port，不顯示管理密碼或一次性碼。
+    if await deny_non_super_camera_user(interaction):  # 逐行註解：非超級使用者不能查看 camera 狀態。
+        return  # 逐行註解：權限不足時不回傳任何服務資訊。
+    status = CAMERA_SERVER.status()  # 逐行註解：只讀取 camera manager 的安全狀態欄位。
+    lines = [  # 逐行註解：組合不含任何密碼內容的 ephemeral 狀態訊息。
+        f"Camera：{'已啟動' if status['camera_active'] else '已停止'}",  # 逐行註解：回報 OpenCV 鏡頭 thread 是否活著。
+        f"網頁伺服器：{'已啟動' if status['server_active'] else '已停止'}",  # 逐行註解：回報 uvicorn 是否正常監聽。
+        f"有效驗證碼：{'有' if status['has_valid_code'] else '無'}",  # 逐行註解：只顯示有無，永遠不顯示六位數內容。
+        f"觀看者已驗證：{'是' if status['viewer_authenticated'] else '否'}",  # 逐行註解：顯示一次性碼是否已換成觀看 session。
+        f"Port：{status['port'] if status['port'] is not None else '未啟動'}",  # 逐行註解：可顯示自動選擇的 port，不顯示管理密碼。
+    ]  # 逐行註解：結束狀態訊息清單。
+    if status["camera_error"]:  # 逐行註解：串流期間鏡頭中斷時額外顯示可行的原因。
+        lines.append(f"鏡頭錯誤：{status['camera_error']}")  # 逐行註解：錯誤文字不包含密碼、驗證碼或 session token。
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)  # 逐行註解：所有 camera status 內容只回覆給超級使用者。
+
+
+tree.add_command(camera_group)  # 逐行註解：把 /camera 群組加入現有 CommandTree，不改動其他 slash commands。
 
 
 @tree.command(name="hello",description="Say hello to the bot")  # 逐行註解：這行是裝飾器，用來替下一個函式或類別加上 Discord/介面設定。
@@ -8819,6 +8908,7 @@ async def run_bot():  # 逐行註解：定義非同步函式 run_bot，可以搭
     )  # 逐行註解：結束上一個跨行函式呼叫或資料結構。
 
     if shutdown_task in done and not bot_task.done():  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
+        await asyncio.to_thread(CAMERA_SERVER.stop)  # 逐行註解：收到 Ctrl+C 或 SIGTERM 時先關閉 camera，避免鏡頭資源殘留。
         await send_shutdown_dm()  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
         await bot.close()  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
 
@@ -8826,6 +8916,7 @@ async def run_bot():  # 逐行註解：定義非同步函式 run_bot，可以搭
         task.cancel()  # 逐行註解：執行這一行，推進 Discord bot、Ollama 或網頁搜尋流程。
 
     if bot_task in done:  # 逐行註解：判斷這個條件是否成立，成立才執行下面縮排的程式。
+        await asyncio.to_thread(CAMERA_SERVER.stop)  # 逐行註解：Discord client 自行結束時也保證 camera 與 uvicorn 會被釋放。
         await send_shutdown_dm()  # 逐行註解：等待非同步工作完成，期間不阻塞整個 Discord bot。
     else:  # 逐行註解：前面條件都不成立時，執行這個備用分支。
         try:  # 逐行註解：開始嘗試執行可能會失敗的程式碼，方便後面捕捉錯誤。
